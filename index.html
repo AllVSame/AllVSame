@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <!-- ── Meta ────────────────────────────────────────────── -->
+        <meta charset="UTF-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+        />
+        <meta name="theme-color" content="#4f46e5" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta
+            name="apple-mobile-web-app-status-bar-style"
+            content="black-translucent"
+        />
+        <title>AllVSame – Compare Ingredients, Save Money</title>
+
+        <!-- ── Favicon (emoji fallback) ────────────────────────── -->
+        <link
+            rel="icon"
+            href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>"
+        />
+
+        <!-- ── Tailwind CSS (CDN) ──────────────────────────────── -->
+        <script src="https://cdn.tailwindcss.com"></script>
+
+        <!-- ── Tailwind custom theme ───────────────────────────── -->
+        <script>
+            tailwind.config = {
+                theme: {
+                    extend: {
+                        colors: {
+                            brand: {
+                                50: "#eef2ff",
+                                100: "#e0e7ff",
+                                200: "#c7d2fe",
+                                300: "#a5b4fc",
+                                400: "#818cf8",
+                                500: "#6366f1",
+                                600: "#4f46e5",
+                                700: "#4338ca",
+                                800: "#3730a3",
+                                900: "#312e81",
+                            },
+                        },
+                        fontFamily: {
+                            sans: [
+                                "-apple-system",
+                                "BlinkMacSystemFont",
+                                '"Segoe UI"',
+                                "Roboto",
+                                '"Helvetica Neue"',
+                                "Arial",
+                                '"Noto Sans"',
+                                "sans-serif",
+                            ],
+                        },
+                        animation: {
+                            "scan-line": "scanLine 2s ease-in-out infinite",
+                            "fade-in": "fadeIn 0.4s ease-out",
+                            "slide-up": "slideUp 0.35s ease-out",
+                            "pulse-soft": "pulseSoft 2s ease-in-out infinite",
+                        },
+                        keyframes: {
+                            scanLine: {
+                                "0%, 100%": { top: "2%" },
+                                "50%": { top: "95%" },
+                            },
+                            fadeIn: {
+                                "0%": { opacity: "0" },
+                                "100%": { opacity: "1" },
+                            },
+                            slideUp: {
+                                "0%": {
+                                    opacity: "0",
+                                    transform: "translateY(20px)",
+                                },
+                                "100%": {
+                                    opacity: "1",
+                                    transform: "translateY(0)",
+                                },
+                            },
+                            pulseSoft: {
+                                "0%, 100%": { opacity: "1" },
+                                "50%": { opacity: "0.7" },
+                            },
+                        },
+                    },
+                },
+            };
+        </script>
+
+        <!-- ── Inline critical styles ──────────────────────────── -->
+        <style>
+            /* ── Root & safe-area overrides ─────────────────────── */
+            html,
+            body {
+                height: 100%;
+                overflow: hidden;
+                -webkit-tap-highlight-color: transparent;
+                overscroll-behavior: none;
+            }
+
+            /* ── Scrollable content area ─────────────────────────── */
+            #scroll-content {
+                height: 100%;
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+                scroll-behavior: smooth;
+                padding-bottom: 5.5rem; /* room for bottom nav */
+            }
+
+            /* ── Hide scrollbar on Webkit (still scrollable) ─────── */
+            #scroll-content::-webkit-scrollbar {
+                display: none;
+            }
+
+            /* ── Camera viewport ─────────────────────────────────── */
+            #scanner-viewport {
+                position: relative;
+                width: 100%;
+                aspect-ratio: 4 / 3;
+                background: #0f172a;
+                border-radius: 1rem;
+                overflow: hidden;
+            }
+            #scanner-viewport video {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+
+            /* ── Scan-line overlay ───────────────────────────────── */
+            .scan-line {
+                position: absolute;
+                left: 8%;
+                right: 8%;
+                height: 3px;
+                background: linear-gradient(
+                    90deg,
+                    transparent,
+                    #4f46e5,
+                    #818cf8,
+                    #4f46e5,
+                    transparent
+                );
+                box-shadow: 0 0 12px rgba(79, 70, 229, 0.6);
+                border-radius: 9999px;
+                z-index: 10;
+                animation: scanLine 2s ease-in-out infinite;
+            }
+
+            /* ── Scan corner brackets ────────────────────────────── */
+            .scan-corner {
+                position: absolute;
+                width: 24px;
+                height: 24px;
+                border-color: #818cf8;
+                z-index: 10;
+            }
+            .scan-corner--tl {
+                top: 12px;
+                left: 12px;
+                border-top: 3px solid;
+                border-left: 3px solid;
+                border-radius: 4px 0 0 0;
+            }
+            .scan-corner--tr {
+                top: 12px;
+                right: 12px;
+                border-top: 3px solid;
+                border-right: 3px solid;
+                border-radius: 0 4px 0 0;
+            }
+            .scan-corner--bl {
+                bottom: 12px;
+                left: 12px;
+                border-bottom: 3px solid;
+                border-left: 3px solid;
+                border-radius: 0 0 0 4px;
+            }
+            .scan-corner--br {
+                bottom: 12px;
+                right: 12px;
+                border-bottom: 3px solid;
+                border-right: 3px solid;
+                border-radius: 0 0 4px 0;
+            }
+
+            /* ── Select custom arrow ─────────────────────────────── */
+            select.custom-select {
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%236366f1' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10l-5 5z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 0.75rem center;
+                background-size: 1rem;
+                padding-right: 2.25rem;
+            }
+
+            /* ── Ingredient tags ─────────────────────────────────── */
+            .ingredient-tag {
+                display: inline-flex;
+                align-items: center;
+                padding: 0.2rem 0.6rem;
+                border-radius: 9999px;
+                font-size: 0.7rem;
+                font-weight: 500;
+                margin: 0.15rem;
+                line-height: 1.3;
+            }
+
+            /* ── Prevent body scroll when modal is open ──────────── */
+            body.scanner-active {
+                overflow: hidden;
+            }
+
+            /* ── Toast animation ─────────────────────────────────── */
+            .toast {
+                transition:
+                    transform 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                    opacity 0.35s ease;
+            }
+            .toast.show {
+                transform: translateY(0);
+                opacity: 1;
+            }
+            .toast.hide {
+                transform: translateY(20px);
+                opacity: 0;
+            }
+
+            /* ── html5-qrcode override ───────────────────────────── */
+            #scanner-viewport .html5-qrcode-element {
+                display: none !important;
+            }
+        </style>
+    </head>
+    <body class="bg-slate-50 text-slate-800 font-sans antialiased">
+        <!-- ════════════════════════════════════════════════════════
+       APP CONTAINER
+       ════════════════════════════════════════════════════════ -->
+        <div
+            id="app"
+            class="relative mx-auto max-w-lg h-full bg-white shadow-2xl"
+            style="max-width: 480px"
+        >
+            <!-- ── SCROLLABLE CONTENT ─────────────────────────────── -->
+            <div id="scroll-content">
+                <!-- ╔══════════════════════════════════════════════════╗
+           ║  HEADER                                         ║
+           ╚══════════════════════════════════════════════════╝ -->
+                <header
+                    class="sticky top-0 z-30 bg-gradient-to-br from-brand-600 via-brand-600 to-brand-800 text-white px-5 pt-5 pb-6 rounded-b-[1.75rem] shadow-lg"
+                >
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="flex items-center gap-2.5">
+                            <span class="text-2xl leading-none">🔍</span>
+                            <h1 class="text-2xl font-extrabold tracking-tight">
+                                All<span class="text-brand-200">VS</span>ame
+                            </h1>
+                        </div>
+                        <span
+                            class="text-[0.65rem] font-medium uppercase tracking-widest bg-white/15 px-3 py-1 rounded-full backdrop-blur-sm"
+                        >
+                            Beta
+                        </span>
+                    </div>
+                    <p class="text-sm text-brand-100 font-medium">
+                        Scan a barcode to see if cheaper alternatives share the
+                        same ingredients
+                    </p>
+
+                    <!-- ── Supermarket Selector ──────────────────────────── -->
+                    <div class="mt-4">
+                        <label
+                            for="supermarket"
+                            class="block text-[0.65rem] font-semibold uppercase tracking-wider text-brand-200 mb-1.5"
+                        >
+                            Compare prices at
+                        </label>
+                        <div class="relative">
+                            <select
+                                id="supermarket"
+                                class="custom-select w-full bg-white/10 backdrop-blur-md border border-white/20 text-white rounded-xl px-4 py-3 text-sm font-medium leading-tight focus:outline-none focus:ring-2 focus:ring-white/40 focus:border-white/30 transition-all duration-200"
+                            >
+                                <option value="tesco" class="text-slate-800">
+                                    Tesco
+                                </option>
+                                <option
+                                    value="sainsburys"
+                                    class="text-slate-800"
+                                >
+                                    Sainsbury's
+                                </option>
+                                <option value="asda" class="text-slate-800">
+                                    Asda
+                                </option>
+                                <option
+                                    value="morrisons"
+                                    class="text-slate-800"
+                                >
+                                    Morrisons
+                                </option>
+                            </select>
+                        </div>
+                    </div>
+                </header>
+
+                <!-- ╔══════════════════════════════════════════════════╗
+           ║  MAIN CONTENT                                   ║
+           ╚══════════════════════════════════════════════════╝ -->
+                <main class="px-4 pt-5 pb-6 space-y-5">
+                    <!-- ── SCANNER SECTION ──────────────────────────────── -->
+                    <section id="scanner-section" class="animate-fade-in">
+                        <div
+                            class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4"
+                        >
+                            <div class="flex items-center justify-between mb-3">
+                                <h2
+                                    class="text-sm font-bold text-slate-700 flex items-center gap-1.5"
+                                >
+                                    <span>📷</span> Barcode Scanner
+                                </h2>
+                                <button
+                                    id="toggle-scanner-btn"
+                                    class="text-xs font-semibold uppercase tracking-wider px-4 py-1.5 rounded-full transition-all duration-200 bg-brand-600 text-white hover:bg-brand-700 active:scale-95 focus:outline-none focus:ring-2 focus:ring-brand-400"
+                                >
+                                    Start Scan
+                                </button>
+                            </div>
+
+                            <!-- Camera viewport -->
+                            <div
+                                id="scanner-viewport"
+                                class="relative mb-3 bg-slate-900 rounded-xl overflow-hidden shadow-inner"
+                            >
+                                <!-- Corner brackets (decorative) -->
+                                <div class="scan-corner scan-corner--tl"></div>
+                                <div class="scan-corner scan-corner--tr"></div>
+                                <div class="scan-corner scan-corner--bl"></div>
+                                <div class="scan-corner scan-corner--br"></div>
+                                <!-- Animated scan line -->
+                                <div class="scan-line" id="scan-line"></div>
+                                <!-- Placeholder overlay when camera is off -->
+                                <div
+                                    id="scanner-placeholder"
+                                    class="absolute inset-0 z-[5] flex flex-col items-center justify-center text-white/60 bg-slate-900/80"
+                                >
+                                    <span class="text-4xl mb-2 opacity-50"
+                                        >📱</span
+                                    >
+                                    <p class="text-sm font-medium">
+                                        Tap <strong>"Start Scan"</strong> to
+                                        begin
+                                    </p>
+                                    <p class="text-[0.65rem] mt-1 opacity-60">
+                                        Position barcode inside the frame
+                                    </p>
+                                </div>
+                                <!-- Scanning indicator dot -->
+                                <div
+                                    id="scanning-dot"
+                                    class="hidden absolute top-3 right-3 z-10 w-2.5 h-2.5 rounded-full bg-green-400 shadow-lg shadow-green-400/50 animate-pulse-soft"
+                                ></div>
+                            </div>
+
+                            <!-- Manual barcode entry -->
+                            <div class="flex gap-2">
+                                <input
+                                    id="manual-barcode"
+                                    type="text"
+                                    inputmode="numeric"
+                                    pattern="[0-9]*"
+                                    placeholder="Or type barcode manually..."
+                                    maxlength="13"
+                                    class="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-brand-400 focus:border-transparent transition-all"
+                                />
+                                <button
+                                    id="manual-search-btn"
+                                    class="bg-slate-100 hover:bg-slate-200 active:scale-95 text-slate-600 font-medium px-4 py-2.5 rounded-xl text-sm transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-brand-400 whitespace-nowrap"
+                                >
+                                    Look Up
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- ── LOADING STATE ────────────────────────────────── -->
+                    <section id="loading-state" class="hidden animate-fade-in">
+                        <div
+                            class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6"
+                        >
+                            <div class="flex flex-col items-center gap-4">
+                                <!-- Spinner -->
+                                <div
+                                    class="w-10 h-10 border-4 border-brand-200 border-t-brand-600 rounded-full animate-spin"
+                                ></div>
+                                <div class="text-center">
+                                    <p
+                                        class="text-sm font-semibold text-slate-700"
+                                        id="loading-text"
+                                    >
+                                        Looking up product…
+                                    </p>
+                                    <p
+                                        class="text-xs text-slate-400 mt-0.5"
+                                        id="loading-subtext"
+                                    >
+                                        Searching our database
+                                    </p>
+                                </div>
+                                <!-- Skeleton blocks -->
+                                <div class="w-full space-y-2.5 mt-1">
+                                    <div
+                                        class="h-4 bg-slate-100 rounded-full w-3/4 animate-pulse"
+                                    ></div>
+                                    <div
+                                        class="h-4 bg-slate-100 rounded-full w-1/2 animate-pulse"
+                                    ></div>
+                                    <div
+                                        class="h-20 bg-slate-50 rounded-xl border border-slate-100"
+                                    ></div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- ── ERROR STATE ──────────────────────────────────── -->
+                    <section id="error-state" class="hidden animate-fade-in">
+                        <div
+                            class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 text-center"
+                        >
+                            <div
+                                class="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center mx-auto mb-3"
+                            >
+                                <span class="text-2xl">⚠️</span>
+                            </div>
+                            <p
+                                class="text-sm font-bold text-slate-700"
+                                id="error-title"
+                            >
+                                Product Not Found
+                            </p>
+                            <p
+                                class="text-xs text-slate-400 mt-1 leading-relaxed"
+                                id="error-message"
+                            >
+                                We couldn't find this product in our database.
+                                Try scanning again or searching manually.
+                            </p>
+                            <button
+                                id="error-retry-btn"
+                                class="mt-4 text-sm font-semibold text-brand-600 bg-brand-50 hover:bg-brand-100 active:scale-95 px-6 py-2.5 rounded-xl transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-brand-400"
+                            >
+                                Try Again
+                            </button>
+                        </div>
+                    </section>
+
+                    <!-- ── RESULTS DISPLAY ─────────────────────────────── -->
+                    <!-- This element is populated dynamically by renderResultsDashboard
+                         and showUserFallbackUI in app.js -->
+                    <div id="results-display"></div>
+
+                    <!-- ── EMPTY / IDLE STATE ───────────────────────────── -->
+                    <section id="idle-state" class="animate-fade-in">
+                        <div
+                            class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 text-center"
+                        >
+                            <div
+                                class="w-16 h-16 rounded-full bg-brand-50 flex items-center justify-center mx-auto mb-3"
+                            >
+                                <span class="text-3xl">🔍</span>
+                            </div>
+                            <p class="text-sm font-bold text-slate-700">
+                                Ready to Scan
+                            </p>
+                            <p
+                                class="text-xs text-slate-400 mt-1 max-w-xs mx-auto leading-relaxed"
+                            >
+                                Point your camera at a product's barcode, or
+                                type the number manually above. We'll find the
+                                best-priced alternative.
+                            </p>
+                            <div
+                                class="flex justify-center gap-6 mt-4 text-xs text-slate-400"
+                            >
+                                <span>📦 Tesco</span>
+                                <span>🔴 Sainsbury's</span>
+                                <span>💚 Asda</span>
+                                <span>💛 Morrisons</span>
+                            </div>
+                        </div>
+                    </section>
+                </main>
+            </div>
+            <!-- ── END SCROLLABLE CONTENT ──────────────────────────── -->
+
+            <!-- ╔══════════════════════════════════════════════════╗
+         ║  BOTTOM NAVIGATION DOCK                         ║
+         ╚══════════════════════════════════════════════════╝ -->
+            <nav
+                class="absolute bottom-0 left-0 right-0 z-30 bg-white/80 backdrop-blur-xl border-t border-slate-200/80 safe-area-bottom"
+            >
+                <div
+                    class="flex items-center justify-around px-2 py-1.5 max-w-lg mx-auto"
+                >
+                    <button
+                        class="nav-btn active flex flex-col items-center gap-0.5 px-4 py-1.5 rounded-xl transition-colors"
+                        data-tab="scan"
+                    >
+                        <span class="text-xl leading-none text-brand-600"
+                            >📷</span
+                        >
+                        <span
+                            class="text-[0.6rem] font-bold text-brand-600 uppercase tracking-wider"
+                            >Scan</span
+                        >
+                    </button>
+                    <button
+                        class="nav-btn flex flex-col items-center gap-0.5 px-4 py-1.5 rounded-xl transition-colors"
+                        data-tab="history"
+                    >
+                        <span class="text-xl leading-none text-slate-400"
+                            >📋</span
+                        >
+                        <span
+                            class="text-[0.6rem] font-semibold text-slate-400 uppercase tracking-wider"
+                            >History</span
+                        >
+                    </button>
+                    <button
+                        class="nav-btn flex flex-col items-center gap-0.5 px-4 py-1.5 rounded-xl transition-colors"
+                        data-tab="about"
+                    >
+                        <span class="text-xl leading-none text-slate-400"
+                            >ℹ️</span
+                        >
+                        <span
+                            class="text-[0.6rem] font-semibold text-slate-400 uppercase tracking-wider"
+                            >About</span
+                        >
+                    </button>
+                </div>
+            </nav>
+
+            <!-- ‑‑ About Panel (hidden overlay) ‑‑ -->
+            <div
+                id="about-panel"
+                class="hidden absolute inset-0 z-20 bg-white animate-slide-up"
+            >
+                <div
+                    class="flex items-center justify-between px-5 py-4 border-b border-slate-100"
+                >
+                    <h2 class="text-lg font-bold text-slate-800">
+                        About AllVSame
+                    </h2>
+                    <button
+                        id="close-about-btn"
+                        class="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-slate-500 hover:bg-slate-200 transition-colors"
+                    >
+                        ✕
+                    </button>
+                </div>
+                <div
+                    class="p-5 space-y-4 text-sm text-slate-600 leading-relaxed overflow-y-auto"
+                    style="max-height: calc(100% - 60px)"
+                >
+                    <p>
+                        <strong class="text-slate-800">AllVSame</strong> helps
+                        you make smarter shopping choices by comparing the
+                        ingredients of brand-name products against cheaper
+                        supermarket alternatives.
+                    </p>
+                    <p>
+                        Simply scan a product's barcode, and we'll find matching
+                        products from Tesco, Sainsbury's, Asda, and Morrisons
+                        that share the same or similar ingredients — often at a
+                        fraction of the price.
+                    </p>
+                    <div
+                        class="bg-brand-50 rounded-xl p-4 border border-brand-100"
+                    >
+                        <p
+                            class="text-xs font-bold text-brand-700 uppercase tracking-wider mb-1.5"
+                        >
+                            How It Works
+                        </p>
+                        <ol
+                            class="text-xs space-y-2 text-slate-600 list-decimal list-inside"
+                        >
+                            <li>Scan a product barcode using your camera</li>
+                            <li>We look up the ingredients in our database</li>
+                            <li>
+                                We find alternatives with matching ingredients
+                            </li>
+                            <li>Compare prices and save money!</li>
+                        </ol>
+                    </div>
+                    <p class="text-xs text-slate-400">
+                        Data sourced from Supabase &amp; Apify. Always check
+                        product labels for the most accurate ingredient
+                        information.
+                    </p>
+                </div>
+            </div>
+
+            <!-- ‑‑ History Panel (hidden overlay) ‑‑ -->
+            <div
+                id="history-panel"
+                class="hidden absolute inset-0 z-20 bg-white animate-slide-up"
+            >
+                <div
+                    class="flex items-center justify-between px-5 py-4 border-b border-slate-100"
+                >
+                    <h2 class="text-lg font-bold text-slate-800">
+                        Scan History
+                    </h2>
+                    <button
+                        id="close-history-btn"
+                        class="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-slate-500 hover:bg-slate-200 transition-colors"
+                    >
+                        ✕
+                    </button>
+                </div>
+                <div
+                    id="history-list"
+                    class="p-5 overflow-y-auto"
+                    style="max-height: calc(100% - 60px)"
+                >
+                    <div
+                        class="flex flex-col items-center justify-center py-12 text-slate-400"
+                    >
+                        <span class="text-3xl mb-2">🕐</span>
+                        <p class="text-sm font-medium">No scans yet</p>
+                        <p class="text-xs mt-0.5">
+                            Scan a product to see it here
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- ════════════════════════════════════════════════════════
+       END APP CONTAINER
+       ════════════════════════════════════════════════════════ -->
+
+        <!-- ── CDN Scripts ────────────────────────────────────── -->
+        <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+        <script src="https://unpkg.com/@supabase/supabase-js@2.39.0/dist/umd/supabase.min.js"></script>
+
+        <!-- ── Application Script ─────────────────────────────── -->
+        <script src="app.js"></script>
+    </body>
+</html>
