@@ -18,7 +18,7 @@
         <!-- ── Favicon (emoji fallback) ────────────────────────── -->
         <link
             rel="icon"
-            href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>"
+            href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%236363f1'/><text y='.9em' font-size='40' fill='white' x='50%25' text-anchor='middle' dominant-baseline='central'>AV</text></svg>"
         />
 
         <!-- ── Tailwind CSS (CDN) ──────────────────────────────── -->
@@ -254,7 +254,6 @@
                 >
                     <div class="flex items-center justify-between mb-2">
                         <div class="flex items-center gap-2.5">
-                            <span class="text-2xl leading-none">🔍</span>
                             <h1 class="text-2xl font-extrabold tracking-tight">
                                 All<span class="text-brand-200">VS</span>ame
                             </h1>
@@ -316,10 +315,8 @@
                             class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4"
                         >
                             <div class="flex items-center justify-between mb-3">
-                                <h2
-                                    class="text-sm font-bold text-slate-700 flex items-center gap-1.5"
-                                >
-                                    <span>📷</span> Barcode Scanner
+                                <h2 class="text-sm font-bold text-slate-700">
+                                    Barcode Scanner
                                 </h2>
                                 <button
                                     id="toggle-scanner-btn"
@@ -346,9 +343,9 @@
                                     id="scanner-placeholder"
                                     class="absolute inset-0 z-[5] flex flex-col items-center justify-center text-white/60 bg-slate-900/80"
                                 >
-                                    <span class="text-4xl mb-2 opacity-50"
-                                        >📱</span
-                                    >
+                                    <span
+                                        class="text-4xl mb-2 opacity-50"
+                                    ></span>
                                     <p class="text-sm font-medium">
                                         Tap <strong>"Start Scan"</strong> to
                                         begin
@@ -433,7 +430,7 @@
                             <div
                                 class="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center mx-auto mb-3"
                             >
-                                <span class="text-2xl">⚠️</span>
+                                <span class="text-2xl">!</span>
                             </div>
                             <p
                                 class="text-sm font-bold text-slate-700"
@@ -470,7 +467,9 @@
                             <div
                                 class="w-16 h-16 rounded-full bg-brand-50 flex items-center justify-center mx-auto mb-3"
                             >
-                                <span class="text-3xl">🔍</span>
+                                <span class="text-2xl font-bold text-brand-600"
+                                    >A</span
+                                >
                             </div>
                             <p class="text-sm font-bold text-slate-700">
                                 Ready to Scan
@@ -485,10 +484,10 @@
                             <div
                                 class="flex justify-center gap-6 mt-4 text-xs text-slate-400"
                             >
-                                <span>📦 Tesco</span>
-                                <span>🔴 Sainsbury's</span>
-                                <span>💚 Asda</span>
-                                <span>💛 Morrisons</span>
+                                <span>Tesco</span>
+                                <span>Sainsbury's</span>
+                                <span>Asda</span>
+                                <span>Morrisons</span>
                             </div>
                         </div>
                     </section>
@@ -510,7 +509,7 @@
                         data-tab="scan"
                     >
                         <span class="text-xl leading-none text-brand-600"
-                            >📷</span
+                            >AV</span
                         >
                         <span
                             class="text-[0.6rem] font-bold text-brand-600 uppercase tracking-wider"
@@ -522,7 +521,7 @@
                         data-tab="history"
                     >
                         <span class="text-xl leading-none text-slate-400"
-                            >📋</span
+                            >H</span
                         >
                         <span
                             class="text-[0.6rem] font-semibold text-slate-400 uppercase tracking-wider"
@@ -534,7 +533,7 @@
                         data-tab="about"
                     >
                         <span class="text-xl leading-none text-slate-400"
-                            >ℹ️</span
+                            >A</span
                         >
                         <span
                             class="text-[0.6rem] font-semibold text-slate-400 uppercase tracking-wider"
@@ -631,7 +630,6 @@
                     <div
                         class="flex flex-col items-center justify-center py-12 text-slate-400"
                     >
-                        <span class="text-3xl mb-2">🕐</span>
                         <p class="text-sm font-medium">No scans yet</p>
                         <p class="text-xs mt-0.5">
                             Scan a product to see it here

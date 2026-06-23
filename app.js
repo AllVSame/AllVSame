@@ -3,91 +3,65 @@
  *  AllVSame — Compare product ingredients & prices across UK supermarkets
  * ═══════════════════════════════════════════════════════════════════════════
  *
+ *  SECURITY ARCHITECTURE
+ *  ─────────────────────
+ *  This frontend contains ZERO secret tokens. All sensitive operations
+ *  (Apify scraping, ingredient matching, database persistence) happen
+ *  inside the Supabase Edge Function at:
+ *
+ *    POST https://zfhpzlgomylyfggwyeqm.supabase.co/functions/v1/verify-and-match
+ *
  *  DATA FLOW:
  *    1. User scans a barcode (or types it manually)
- *    2. handleProductScan() orchestrates three phases:
- *       Phase A — Check browser's localStorage for cached product data
- *       Phase B — If not cached, fetch from Open Food Facts (free public API)
- *       Phase C — If OFF has no data, scrape via Apify (synchronous await)
- *    3. Product data is saved to Supabase via saveToLocalCache() with
- *       'Prefer: resolution=merge-duplicates' for safe overwrites
- *    4. Alternatives are found in the same category from other supermarkets
- *    5. Ingredient lists are compared using Jaccard similarity
- *    6. renderResultsDashboard() builds a Tailwind CSS dashboard inside
+ *    2. handleProductScan() POSTs { barcode, supermarket } to the edge function
+ *    3. The edge function runs Phases A–E (cache check, OFF, Apify, match, save)
+ *    4. The edge function returns { product, alternatives, bestAlternative, comparison }
+ *    5. renderResultsDashboard() builds a Tailwind CSS dashboard inside
  *       the HTML element with ID "results-display"
  *
- *  EXTERNAL APIs:
- *    - Open Food Facts:     https://world.openfoodfacts.org/api/v0/product/{barcode}.json
- *    - Apify:               https://api.apify.com/v2/acts/{actorId}/runs
- *    - Supabase (your DB):  https://zfhpzlgomylyfggwyeqm.supabase.co/rest/v1/products
+ *  PUBLIC VARIABLES (safe in client code):
+ *    - SUPABASE_URL       — Project URL (public)
+ *    - SUPABASE_ANON_KEY  — Public anon key (safe for client-side use)
+ *
+ *  SECRETS (NEVER in client code):
+ *    - APIFY_TOKEN             → Deno.env on the edge function
+ *    - SERVICE_ROLE_KEY        → Deno.env on the edge function
+ *
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  1.  CONFIGURATION                                                      ║
-// ║     Paste your API keys and tokens below between the quote marks.       ║
-// ║     These are safe to leave in client-side code (public anon key).      ║
+// ║     Only public-facing variables live here. All secrets are server-side. ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 // ── Supabase ───────────────────────────────────────────────────────────────
 // Your Supabase project URL and the public anonymous (anon) API key.
 // Find these in your Supabase dashboard under Project Settings → API.
-// ╔══════════════════════════════════════════════════════════════════════╗
-// ║  IMPORTANT: Replace these placeholder values with your real keys!   ║
-// ║  Get Supabase keys from: Project Settings → API                     ║
-// ║  Get Apify token from:    Integrations → API                        ║
-// ╚══════════════════════════════════════════════════════════════════════╝
+// These are safe to leave in client-side code (the anon key is public).
 const SUPABASE_URL = "https://zfhpzlgomylyfggwyeqm.supabase.co";
 const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpmaHB6bGdvbXlseWZnZ3d5ZXFtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwODA0NjAsImV4cCI6MjA5NzY1NjQ2MH0.TeNO6CpmHVbC15RMMngkl_GxJDRjBB4X1ZZ9FNKYUbM";
 
-// ── Apify ──────────────────────────────────────────────────────────────────
-// Your Apify API token. Get this from your Apify account → Integrations → API.
-// Used as a fallback to scrape product data from supermarket websites.
-const APIFY_TOKEN = "YOUR_APIFY_TOKEN_HERE";
+// ── Edge Function URL ──────────────────────────────────────────────────────
+// This is the secure backend that handles all data fetching and comparison.
+// The APIFY_TOKEN lives inside this function's Deno environment — NEVER here.
+const EDGE_FUNCTION_URL = SUPABASE_URL + "/functions/v1/verify-and-match";
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  2.  SUPERMARKET LOOKUP TABLE                                           ║
-// ║     Maps internal IDs to display names, emojis and brand colours.       ║
+// ║     Maps internal IDs to display names, hex colours, and supermarket info.║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 const SUPERMARKETS = {
-  tesco: { name: "Tesco", emoji: "📦", hex: "#00539f" },
-  sainsburys: { name: "Sainsbury's", emoji: "🔴", hex: "#e2231a" },
-  asda: { name: "Asda", emoji: "💚", hex: "#68c000" },
-  morrisons: { name: "Morrisons", emoji: "💛", hex: "#f9a200" },
+  tesco: { name: "Tesco", hex: "#00539f" },
+  sainsburys: { name: "Sainsbury's", hex: "#e2231a" },
+  asda: { name: "Asda", hex: "#68c000" },
+  morrisons: { name: "Morrisons", hex: "#f9a200" },
 };
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  3.  SUPABASE CLIENT                                                    ║
-// ║     Initialised once at startup using the Supabase JS UMD library.      ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-let supabase = null;
-
-/**
- * Creates the Supabase client if the library is available.
- * Safe to call multiple times — it only initialises once.
- */
-function initSupabase() {
-  if (supabase) return; // already initialised
-
-  // The Supabase UMD bundle exposes itself as window.supabase
-  // We check for both possible global names across library versions
-  const SupabaseLib = window.supabase || window.supabaseJs;
-  if (!SupabaseLib || !SupabaseLib.createClient) {
-    console.warn(
-      "[AllVSame] Supabase library not loaded. Saving to Supabase will be skipped.",
-    );
-    return;
-  }
-
-  supabase = SupabaseLib.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  console.log("[AllVSame] Supabase client ready");
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  4.  APPLICATION STATE                                                  ║
+// ║  3.  APPLICATION STATE                                                  ║
 // ║     Central object that holds all runtime data for the app.             ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -121,86 +95,72 @@ const state = {
 };
 
 // Key used to store the local cache in the browser's localStorage
+// This is a UX optimization for instant re-scans. It is NOT a security secret.
 const LOCAL_CACHE_KEY = "allvsame_local_cache";
 
 // Key used to store the scan history in localStorage
 const HISTORY_STORAGE_KEY = "allvsame_scan_history";
 
+// Key used to remember that the user previously granted camera access.
+const CAMERA_PERMISSION_KEY = "avs_camera_permission";
+
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  5.  DOM REFERENCES                                                      ║
+// ║  4.  DOM REFERENCES                                                      ║
 // ║     Cached once after the page loads for fast lookups.                  ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 const DOM = {};
 
 /**
- * Scans the document for every element we need by its "id" attribute
- * and stores a reference in the DOM object.
- *
- * For example, an element with id="toggle-scanner-btn" becomes
- * available as DOM.toggle_scanner_btn (hyphens become underscores).
+ * Caches references to frequently accessed DOM elements.
+ * Call once after the page has loaded.
  */
 function cacheDomRefs() {
-  const ids = [
-    "toggle-scanner-btn",
-    "scanner-viewport",
-    "scanner-placeholder",
-    "scan-line",
-    "scanning-dot",
-    "manual-barcode",
-    "manual-search-btn",
-    "supermarket",
-    "loading-state",
-    "loading-text",
-    "loading-subtext",
-    "error-state",
-    "error-title",
-    "error-message",
-    "error-retry-btn",
-    "results-display",
-    "idle-state",
-    "scanner-section",
-    "about-panel",
-    "close-about-btn",
-    "history-panel",
-    "close-history-btn",
-    "history-list",
-  ];
-
-  ids.forEach((id) => {
-    const el = document.getElementById(id);
-    if (el) DOM[id.replace(/-/g, "_")] = el;
-  });
-
-  // Cache the bottom navigation buttons (they use a class, not an id)
+  DOM.scanner_section = document.getElementById("scanner-section");
+  DOM.scanner_viewport = document.getElementById("scanner-viewport");
+  DOM.scanner_placeholder = document.getElementById("scanner-placeholder");
+  DOM.scanning_dot = document.getElementById("scanning-dot");
+  DOM.scan_line = document.getElementById("scan-line");
+  DOM.toggle_scanner_btn = document.getElementById("toggle-scanner-btn");
+  DOM.manual_barcode = document.getElementById("manual-barcode");
+  DOM.manual_search_btn = document.getElementById("manual-search-btn");
+  DOM.supermarket = document.getElementById("supermarket-select");
+  DOM.results_display = document.getElementById("results-display");
+  DOM.loading_state = document.getElementById("loading-state");
+  DOM.loading_text = document.getElementById("loading-text");
+  DOM.loading_subtext = document.getElementById("loading-subtext");
+  DOM.error_state = document.getElementById("error-state");
+  DOM.error_title = document.getElementById("error-title");
+  DOM.error_message = document.getElementById("error-message");
+  DOM.error_retry_btn = document.getElementById("error-retry-btn");
+  DOM.idle_state = document.getElementById("idle-state");
+  DOM.about_panel = document.getElementById("about-panel");
+  DOM.close_about_btn = document.getElementById("close-about-btn");
+  DOM.history_panel = document.getElementById("history-panel");
+  DOM.history_list = document.getElementById("history-list");
+  DOM.close_history_btn = document.getElementById("close-history-btn");
   DOM.navBtns = document.querySelectorAll(".nav-btn");
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  6.  MAIN ENTRY POINT — handleProductScan()                             ║
+// ║  5.  MAIN ENTRY POINT — handleProductScan()                             ║
 // ║                                                                         ║
-// ║  This is the central orchestrator. It runs three data-fetching phases   ║
-// ║  in order, stopping at the first one that returns useful data:          ║
-// ║                                                                         ║
-// ║    Phase A — Local cache (browser's localStorage)                       ║
-// ║               Fastest; avoids a network call for repeat scans.          ║
-// ║                                                                         ║
-// ║    Phase B — Open Food Facts API (free, public food database)           ║
-// ║               Covers hundreds of thousands of branded products.         ║
-// ║                                                                         ║
-// ║    Phase C — Apify scraper                                              ║
-// ║               Runs synchronously (awaited) to scrape UK supermarket     ║
-// ║               websites when the other sources have no data.             ║
-// ║                                                                         ║
-// ║  Once product data is obtained it is:                                   ║
-// ║    1. Saved to Supabase via saveToLocalCache()                          ║
-// ║    2. Used to find alternatives from other supermarkets                 ║
-// ║    3. Compared ingredient-by-ingredient with the best alternative       ║
-// ║    4. Displayed via renderResultsDashboard()                            ║
+// ║  Makes a single POST request to the secure Supabase Edge Function.       ║
+// ║  The edge function handles:                                             ║
+// ║    Phase A — Check Supabase product cache                               ║
+// ║    Phase B — Open Food Facts API (free, no key)                         ║
+// ║    Phase C — Apify scraper (using secret token from Deno.env)           ║
+// ║    Phase D — Find alternatives in the same category                     ║
+// ║    Phase E — Jaccard ingredient-match calculation                       ║
+// ║    Save   — Upsert result to Supabase "products" table                  ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
  * Main entry point. Call this when a barcode is scanned or typed.
+ *
+ * The function first checks the browser's localStorage for an instant
+ * re-scan result. If not cached, it POSTs to the secure edge function
+ * which runs the full pipeline server-side.
  *
  * @param {string} barcode            - The product barcode (e.g. "5012345678900")
  * @param {string} selectedSupermarket - Supermarket ID ("tesco", "sainsburys", etc.)
@@ -210,169 +170,105 @@ async function handleProductScan(barcode, selectedSupermarket) {
   if (state.isLoading) return;
   state.isLoading = true;
 
-  // Show the loading spinner
-  showLoadingUI("Scanning product data…", "Checking multiple sources");
+  showLoadingUI("Scanning product data…", "Checking our database");
 
   try {
-    // ═════════════════════════════════════════════════════════════════════
-    //  PHASE A — Local Cache (browser's localStorage)
-    // ═════════════════════════════════════════════════════════════════════
-    //
-    //  Check if we already looked up this barcode before. The cache stores
-    //  a simple { barcode → productData } map. This avoids unnecessary API
-    //  calls when the user re-scans the same product.
+    // ── Phase 0: Check browser's localStorage for fast re-scans ─────────
+    //     This is a pure UX optimization — no secrets involved.
+    let responseData = checkLocalCache(barcode);
 
-    let productData = checkLocalCache(barcode);
-
-    if (productData) {
+    if (responseData) {
       console.log(
-        "[AllVSame] Phase A: found in local cache →",
-        productData.name,
+        "[AllVSame] Found in local cache →",
+        responseData.product?.name,
       );
       updateLoadingUI("Using cached data", "Found in local storage");
-    }
+    } else {
+      // ── Phase 1: Call the secure edge function ────────────────────────
+      //     All API keys, database writes, and comparison logic live here.
+      updateLoadingUI("Scanning securely…", "Edge function processing");
 
-    // ═════════════════════════════════════════════════════════════════════
-    //  PHASE B — Open Food Facts API (free, open public database)
-    // ═════════════════════════════════════════════════════════════════════
-    //
-    //  Open Food Facts is a crowd-sourced database of food products from
-    //  around the world. It includes ingredient lists, brands, categories,
-    //  and nutrition data. The API is free and requires no key.
-    //
-    //  We only call this if Phase A did not find anything.
+      const edgeResponse = await fetch(EDGE_FUNCTION_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({
+          barcode: barcode,
+          supermarket: selectedSupermarket,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
 
-    if (!productData) {
-      updateLoadingUI(
-        "Phase B: querying Open Food Facts…",
-        "Free public food database",
-      );
-      productData = await fetchFromOpenFoodFacts(barcode);
-
-      if (productData) {
-        console.log(
-          "[AllVSame] Phase B: Open Food Facts found →",
-          productData.name,
+      // ── Handle HTTP 429 — Rate limited ──────────────────────────────
+      if (edgeResponse.status === 429) {
+        const errorBody = await edgeResponse.json().catch(() => ({}));
+        showUserFallbackUI(
+          "You've reached the scan limit. " +
+            (errorBody.message ||
+              "Please wait 60 seconds before scanning again."),
+          "error",
         );
-      } else {
-        console.log("[AllVSame] Phase B: Open Food Facts returned nothing");
+        state.isLoading = false;
+        return;
       }
+
+      // ── Handle HTTP 404 — Product not found ─────────────────────────
+      if (edgeResponse.status === 404) {
+        const errorBody = await edgeResponse.json().catch(() => ({}));
+        showUserFallbackUI(
+          errorBody.message ||
+            "We searched everywhere but could not find data for barcode <strong>" +
+              escapeHtml(barcode) +
+              "</strong>. Try a different product.",
+          "error",
+        );
+        state.isLoading = false;
+        return;
+      }
+
+      // ── Handle other HTTP errors ───────────────────────────────────
+      if (!edgeResponse.ok) {
+        const errorBody = await edgeResponse.json().catch(() => ({}));
+        throw new Error(
+          errorBody.message || `Server returned HTTP ${edgeResponse.status}`,
+        );
+      }
+
+      // ── Parse the response ─────────────────────────────────────────
+      responseData = await edgeResponse.json();
+
+      // Cache the result in localStorage for instant re-scans
+      updateLocalCache(barcode, responseData);
     }
 
-    // ═════════════════════════════════════════════════════════════════════
-    //  PHASE C — Apify Scraper (synchronous — we await it)
-    // ═════════════════════════════════════════════════════════════════════
-    //
-    //  If neither the local cache nor Open Food Facts had the product, we
-    //  fall back to scraping UK supermarket websites via Apify.
-    //
-    //  This runs synchronously in the sense that we await the result before
-    //  continuing — the user sees a loading state until it completes.
-
-    if (!productData) {
-      updateLoadingUI(
-        "Phase C: scraping supermarket websites…",
-        "Searching via Apify",
-      );
-
-      try {
-        productData = await scrapeWithApify(barcode);
-      } catch (apifyErr) {
-        console.warn("[AllVSame] Phase C: Apify scrape failed:", apifyErr);
-        productData = null;
-      }
-
-      if (productData) {
-        console.log("[AllVSame] Phase C: Apify scraped →", productData.name);
-      } else {
-        console.log("[AllVSame] Phase C: Apify also found nothing");
-      }
-    }
-
-    // ═════════════════════════════════════════════════════════════════════
-    //  HANDLE: No data found from any source
-    // ═════════════════════════════════════════════════════════════════════
-
-    if (!productData) {
+    // ── Validate the response has all required fields ──────────────────
+    if (!responseData || !responseData.product) {
       showUserFallbackUI(
-        "We searched everywhere (local cache, Open Food Facts, and supermarket websites) " +
-          "but could not find data for barcode <strong>" +
-          escapeHtml(barcode) +
-          "</strong>. " +
-          "Try scanning a different product or check the barcode number.",
+        "The server returned incomplete data. Please try again.",
         "error",
       );
       state.isLoading = false;
       return;
     }
 
-    // ═════════════════════════════════════════════════════════════════════
-    //  SAVE TO SUPABASE (via saveToLocalCache)
-    // ═════════════════════════════════════════════════════════════════════
-    //
-    //  Persist the product data to your Supabase "products" table using a
-    //  POST request with the 'Prefer: resolution=merge-duplicates' header.
-    //  This safely overwrites any existing row with the same barcode.
+    const product = responseData.product;
+    const alternatives = responseData.alternatives || [];
+    const bestAlternative = responseData.bestAlternative || null;
+    const comparison = responseData.comparison || null;
 
-    updateLoadingUI("Saving to database…", "Updating product cache");
-
-    try {
-      await saveToLocalCache(productData);
-    } catch (saveErr) {
-      // Non-fatal: the app still works, just without persistence
-      console.warn("[AllVSame] Could not save to Supabase:", saveErr);
-    }
-
-    // Update the browser's local cache too (for fast re-scans)
-    updateLocalCache(barcode, productData);
-
-    // ═════════════════════════════════════════════════════════════════════
-    //  FIND ALTERNATIVES & COMPARE INGREDIENTS
-    // ═════════════════════════════════════════════════════════════════════
-
-    state.currentProduct = productData;
-
-    updateLoadingUI(
-      "Finding alternatives…",
-      "Comparing ingredients across supermarkets",
-    );
-
-    const alternatives = await findAlternatives(
-      productData,
-      selectedSupermarket,
-    );
+    // ── Update state ──────────────────────────────────────────────────
+    state.currentProduct = product;
     state.alternatives = alternatives;
-
-    // ── Determine the best alternative ─────────────────────────────────
-    //     Prefer one from the user-selected supermarket, otherwise pick
-    //     the highest-scoring match overall.
-
-    let bestAlt = null;
-    if (alternatives.length > 0) {
-      bestAlt =
-        alternatives.find((a) => a.supermarket === selectedSupermarket) ||
-        alternatives[0];
-    }
-    state.bestAlternative = bestAlt;
-
-    // ── Calculate the ingredient match ────────────────────────────────
-    let comparison = null;
-    if (bestAlt) {
-      comparison = calculateIngredientMatch(
-        productData.ingredients || "",
-        bestAlt.ingredients || "",
-      );
-      state.lastComparison = comparison;
-    }
+    state.bestAlternative = bestAlternative;
+    state.lastComparison = comparison;
 
     // ── Add to scan history ───────────────────────────────────────────
-    addToScanHistory(productData);
+    addToScanHistory(product);
 
-    // ═════════════════════════════════════════════════════════════════════
-    //  RENDER THE RESULTS DASHBOARD
-    // ═════════════════════════════════════════════════════════════════════
-
-    renderResultsDashboard(productData, bestAlt, comparison);
+    // ── Render the results dashboard ──────────────────────────────────
+    renderResultsDashboard(product, bestAlternative, comparison);
 
     // Scroll the results into view
     setTimeout(() => {
@@ -382,28 +278,49 @@ async function handleProductScan(barcode, selectedSupermarket) {
 
     state.isLoading = false;
   } catch (err) {
-    // ── Catch any unexpected error in the entire pipeline ──────────────
-    console.error("[AllVSame] handleProductScan error:", err);
-    showUserFallbackUI(
-      "Something unexpected went wrong: <em>" +
-        escapeHtml(err.message) +
-        "</em>. " +
-        "Please try again or refresh the page.",
-      "error",
-    );
+    // ── Catch network errors, timeouts, or unexpected failures ────────
+
+    // Detect network disconnects
+    if (
+      err.name === "TypeError" &&
+      (err.message.includes("NetworkError") ||
+        err.message.includes("Failed to fetch") ||
+        err.message.includes("Load failed"))
+    ) {
+      showUserFallbackUI(
+        "Unable to reach the server. Please check your internet connection and try again.",
+        "error",
+      );
+    } else if (err.name === "TimeoutError" || err.name === "AbortError") {
+      showUserFallbackUI(
+        "The request timed out. Our servers may be busy — please try again shortly.",
+        "error",
+      );
+    } else {
+      console.error("[AllVSame] handleProductScan error:", err);
+      showUserFallbackUI(
+        "Something unexpected went wrong: <em>" +
+          escapeHtml(err.message || "Unknown error") +
+          "</em>. Please try again or refresh the page.",
+        "error",
+      );
+    }
+
     state.isLoading = false;
   }
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  7.  PHASE A — Local Cache (browser's localStorage)                     ║
+// ║  6.  LOCAL BROWSER CACHE (UX optimization only)                         ║
+// ║     Stores recently scanned products for instant re-scan.               ║
+// ║     This is client-only; no secrets are involved.                       ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
  * Looks up a barcode in the browser's localStorage cache.
  *
  * @param  {string} barcode - The product barcode.
- * @returns {object|null}     The cached product data, or null if not found.
+ * @returns {object|null}     The cached response data, or null if not found.
  */
 function checkLocalCache(barcode) {
   try {
@@ -419,11 +336,11 @@ function checkLocalCache(barcode) {
 }
 
 /**
- * Stores product data in the browser's localStorage cache under the
- * given barcode key. The cache persists across browser sessions.
+ * Stores the edge function response in the browser's localStorage cache
+ * under the given barcode key. Keeps only the most recent 200 entries.
  *
  * @param {string} barcode - The product barcode.
- * @param {object} data    - The product data object to cache.
+ * @param {object} data    - The response data object to cache.
  */
 function updateLocalCache(barcode, data) {
   try {
@@ -446,593 +363,9 @@ function updateLocalCache(barcode, data) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  8.  PHASE B — Open Food Facts API                                      ║
-// ║                                                                         ║
-// ║  Docs: https://world.openfoodfacts.org/api/v0/product/{barcode}.json    ║
-// ║  Free, no API key required. Returns JSON with product_name, brands,     ║
-// ║  ingredients_text, categories, image_url, and more.                     ║
+// ║  7.  UI STATE MANAGEMENT                                                ║
+// ║     Functions to show/hide the various states of the app.               ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-
-/**
- * Fetches product data from the Open Food Facts public API.
- *
- * @param  {string} barcode - The product barcode (EAN-13 / GTIN format).
- * @returns {object|null}     A product object matching our schema, or null.
- */
-async function fetchFromOpenFoodFacts(barcode) {
-  const url = `https://world.openfoodfacts.org/api/v0/product/${barcode}.json`;
-
-  let response;
-  try {
-    response = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  } catch (err) {
-    console.warn("[AllVSame] OFF network error:", err);
-    return null;
-  }
-
-  if (!response.ok) {
-    console.warn("[AllVSame] OFF HTTP", response.status);
-    return null;
-  }
-
-  let json;
-  try {
-    json = await response.json();
-  } catch (err) {
-    console.warn("[AllVSame] OFF JSON parse error:", err);
-    return null;
-  }
-
-  // The OFF API returns { status: 1, product: { ... } } when found
-  if (!json || json.status !== 1 || !json.product) {
-    return null;
-  }
-
-  const p = json.product;
-
-  // Extract the ingredients text — OFF stores it in a language-keyed
-  // object like { "en": "Water, Sugar, ..." }. We try the "en" key
-  // first, then fall back to any language's value.
-  let ingredientsText = "";
-  if (typeof p.ingredients_text === "string") {
-    ingredientsText = p.ingredients_text;
-  } else if (p.ingredients_text && typeof p.ingredients_text === "object") {
-    ingredientsText =
-      p.ingredients_text.en || Object.values(p.ingredients_text)[0] || "";
-  }
-
-  // Map the OFF response into our internal product schema
-  return {
-    barcode: barcode,
-    name: p.product_name || `Product ${barcode}`,
-    brand: p.brands || "Unknown Brand",
-    supermarket: "unknown", // OFF doesn't specify a supermarket
-    category: p.categories || "Unknown",
-    ingredients: ingredientsText || "",
-    price: null, // OFF doesn't provide prices
-    image_url: p.image_url || "",
-    source: "openfoodfacts", // tells us where this came from
-  };
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  9.  PHASE C — Apify Scraper                                            ║
-// ║                                                                         ║
-// ║  Runs synchronously (awaited) to scrape UK supermarket product pages.   ║
-// ║  Falls back gracefully — returns null if anything fails.                ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-/**
- * Attempts to scrape product data from UK supermarket websites via Apify.
- *
- * @param  {string} barcode - The product barcode.
- * @returns {object|null}     A product object, or null if scraping failed.
- */
-async function scrapeWithApify(barcode) {
-  console.log("[AllVSame] Apify: scraping for barcode", barcode);
-
-  // Generic Apify Web Scraper actor ID.
-  // Replace with a supermarket-specific actor for better results:
-  //   Tesco:      jancurn/tesco-product-scraper
-  //   Sainsburys: drobnikj/sainsburys-scraper
-  //   Asda:       drobnikj/asda-scraper
-  //   Morrisons:  drobnikj/morrisons-scraper
-  const APIFY_ACTOR_ID = "aYG0l9s7dbB7j3gbS";
-
-  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR_ID}/runs?token=${APIFY_TOKEN}`;
-
-  const payload = {
-    runInput: {
-      startUrls: [
-        {
-          url: `https://www.tesco.com/groceries/en-GB/search?query=${barcode}`,
-        },
-        { url: `https://www.sainsburys.co.uk/gol/productsearch?q=${barcode}` },
-        { url: `https://www.asda.com/search?q=${barcode}` },
-        { url: `https://www.morrisons.com/search?q=${barcode}` },
-      ],
-      maxPagesPerCrawl: 5,
-      maxResults: 3,
-    },
-  };
-
-  let response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(15000),
-    });
-  } catch (err) {
-    console.warn("[AllVSame] Apify network error:", err);
-    return null;
-  }
-
-  if (!response.ok) {
-    console.warn("[AllVSame] Apify HTTP", response.status);
-    return null;
-  }
-
-  let result;
-  try {
-    result = await response.json();
-  } catch (err) {
-    console.warn("[AllVSame] Apify JSON error:", err);
-    return null;
-  }
-
-  // Parse the first item from the scraped dataset
-  if (result && result.data && result.data.length > 0) {
-    const scraped = result.data[0];
-
-    return {
-      barcode: barcode,
-      name: scraped.title || scraped.name || `Product ${barcode}`,
-      brand: scraped.brand || "Unknown Brand",
-      supermarket: inferSupermarketFromUrl(scraped.url || ""),
-      category: scraped.category || "Unknown",
-      ingredients:
-        scraped.ingredients || extractIngredientsFromScraped(scraped) || "",
-      price: parseFloat(scraped.price || scraped.currentPrice) || null,
-      image_url: scraped.image || scraped.imageUrl || "",
-      source: "apify",
-    };
-  }
-
-  return null;
-}
-
-/**
- * Tries to determine which supermarket a URL belongs to.
- * @param {string} url - The product page URL from Apify.
- * @returns {string} Supermarket ID key.
- */
-function inferSupermarketFromUrl(url) {
-  const u = url.toLowerCase();
-  if (u.includes("tesco")) return "tesco";
-  if (u.includes("sainsburys")) return "sainsburys";
-  if (u.includes("asda")) return "asda";
-  if (u.includes("morrisons")) return "morrisons";
-  return "tesco"; // best guess
-}
-
-/**
- * Best-effort extraction of ingredient text from scraped data.
- * Tries several common field names that Apify scrapers may use.
- *
- * @param {object} scraped - Raw Apify output item.
- * @returns {string} Extracted ingredient text, or empty string.
- */
-function extractIngredientsFromScraped(scraped) {
-  const candidates = [
-    "ingredients",
-    "description",
-    "details",
-    "features",
-    "specifications",
-  ];
-  for (const field of candidates) {
-    const val = scraped[field];
-    if (val && typeof val === "string" && val.length > 10) {
-      return val.substring(0, 1000);
-    }
-  }
-  return "";
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  10.  SUPABASE PERSISTENCE — saveToLocalCache()                          ║
-// ║                                                                          ║
-// ║  POSTs product data to your Supabase "products" table with the           ║
-// ║  'Prefer: resolution=merge-duplicates' header. This tells PostgREST      ║
-// ║  (the REST API behind Supabase) to treat the barcode column as a         ║
-// ║  conflict target and merge the new data into the existing row instead    ║
-// ║  of throwing a duplicate-key error.                                      ║
-// ║                                                                          ║
-// ║  NOTE: Your "products" table MUST have a UNIQUE constraint on the         ║
-// ║  "barcode" column for merge-duplicates to work.                          ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-/**
- * Saves (or overwrites) a product record in Supabase using a POST request
- * with the 'Prefer: resolution=merge-duplicates' header.
- *
- * @param {object} product - The product data object to persist.
- * @returns {Promise<boolean>} true on success, false on failure.
- */
-async function saveToLocalCache(product) {
-  // If the Supabase client wasn't initialised, we skip the save.
-  // The app still works — it just won't persist to Supabase.
-  if (!supabase) {
-    console.log(
-      "[AllVSame] Supabase not available — skipping saveToLocalCache",
-    );
-    return false;
-  }
-
-  try {
-    // Build a clean record that matches the expected "products" table schema.
-    const record = {
-      barcode: product.barcode,
-      name: product.name,
-      brand: product.brand || null,
-      supermarket: product.supermarket || "unknown",
-      category: product.category || null,
-      ingredients: product.ingredients || null,
-      price: product.price != null ? product.price : null,
-      image_url: product.image_url || null,
-      source: product.source || "scan",
-    };
-
-    // We use the Supabase JS client's upsert() method, which internally
-    // sends a POST request with 'Prefer: resolution=merge-duplicates'.
-    //
-    // The "onConflict" option tells it which column has the unique constraint.
-    const { error } = await supabase
-      .from("products")
-      .upsert(record, { onConflict: "barcode" });
-
-    if (error) {
-      console.warn("[AllVSame] saveToLocalCache upsert error:", error);
-      return false;
-    }
-
-    console.log("[AllVSame] Product saved to Supabase:", product.barcode);
-    return true;
-  } catch (err) {
-    console.warn("[AllVSame] saveToLocalCache exception:", err);
-    return false;
-  }
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  11.  INGREDIENT COMPARISON ENGINE                                      ║
-// ║                                                                         ║
-// ║  Uses Jaccard similarity coefficient to measure how closely two         ║
-// ║  ingredient lists match. The algorithm:                                 ║
-// ║                                                                         ║
-// ║    1. Parse each ingredient string into individual items                ║
-// ║    2. Normalise each item:                                              ║
-// ║       - Convert to lowercase                                         ║
-// ║       - Strip content inside brackets/parentheses                   ║
-// ║       - Remove punctuation and filler marketing words               ║
-// ║       - Trim whitespace                                             ║
-// ║       - Discard empty or trivial items                              ║
-// ║    3. Compute |intersection| / |union| × 100                        ║
-// ║    4. Also compute brand-match ratio: % of brand's ingredients      ║
-// ║       that appear in the alternative                                ║
-// ╚══════════════════════════════════════════════════════════════════════╝
-
-/**
- * Normalises a single ingredient string by:
- *   - Lowercasing
- *   - Removing parenthetical notes like "(1%)", "(May contain traces of nuts)"
- *   - Stripping punctuation (commas, periods, quotes, angle brackets)
- *   - Removing common filler marketing adjectives
- *   - Trimming excess whitespace
- *
- * @param {string} text - A raw ingredient name.
- * @returns {string}     The clean, normalised ingredient name.
- */
-function normalizeIngredient(text) {
-  if (!text || typeof text !== "string") return "";
-
-  // Step 1 — Lowercase
-  let t = text.toLowerCase();
-
-  // Step 2 — Remove content in parentheses and brackets, including the brackets
-  //          e.g. "Salt (1%)"       → "Salt"
-  //          e.g. "Milk [contains]" → "Milk"
-  t = t.replace(/\([^)]*\)/g, "");
-  t = t.replace(/\[[^\]]*\]/g, "");
-
-  // Step 3 — Strip punctuation characters that add no meaning
-  t = t.replace(/[<>"'.,;:!?™®]/g, "");
-
-  // Step 4 — Remove common filler / marketing adjectives.
-  //          These words add no chemical meaning and inflate the match score.
-  //          We remove them as whole words (surrounded by word boundaries).
-  const fillerWords = [
-    "organic",
-    "natural",
-    "artisan",
-    "artisanal",
-    "premium",
-    "traditional",
-    "finest",
-    "fresh",
-    "pure",
-    "real",
-    "authentic",
-    "original",
-    "classic",
-    "selected",
-    "quality",
-    "extra",
-    "special",
-    "fine",
-    "best",
-    "great",
-    "farm",
-    "estate",
-    "kitchen",
-    "style",
-    " rustic",
-    "country",
-    "specially",
-    "carefully",
-    "expertly",
-    "hand",
-    "handcrafted",
-    "matured",
-    "aged",
-    "smoked",
-    "wood",
-    "fire",
-    "stoneground",
-    "cold",
-    "pressed",
-    "unrefined",
-    "wild",
-    "free",
-    "range",
-  ];
-
-  // Build a regex that matches any of the filler words as whole tokens.
-  // The (^|\\s) and (\\s|$) ensure we only match whole words.
-  const fillerRegex = new RegExp(
-    "(^|\\s)(" + fillerWords.join("|") + ")(?=\\s|$)",
-    "gi",
-  );
-  t = t.replace(fillerRegex, " ");
-
-  // Step 5 — Collapse multiple spaces into one and trim
-  t = t.replace(/\s+/g, " ").trim();
-
-  return t;
-}
-
-/**
- * Splits a raw ingredient string on commas and normalises each item.
- *
- * @param {string} str - Raw ingredient list, e.g. "Water, Sugar, Salt (1%)"
- * @returns {string[]}  Array of normalised ingredient names.
- */
-function parseIngredients(str) {
-  if (!str || typeof str !== "string") return [];
-
-  const items = str
-    .split(",")
-    .map((item) => normalizeIngredient(item))
-    .filter((item) => item.length > 1); // discard single characters
-
-  // Deduplicate within the same list (some products list the same ingredient
-  // in multiple forms)
-  return [...new Set(items)];
-}
-
-/**
- * Calculates the ingredient match percentage between two products using
- * the Jaccard similarity coefficient.
- *
- * Result includes:
- *   percentage       - Overall Jaccard similarity (0–100)
- *   brandMatchRatio  - % of the brand product's ingredients found in the alt
- *   matching         - Ingredients present in BOTH products
- *   differingA       - Ingredients ONLY in the brand product
- *   differingB       - Ingredients ONLY in the alternative product
- *
- * @param {string} ingredientsA - Ingredient list from the brand (scanned) product.
- * @param {string} ingredientsB - Ingredient list from the alternative product.
- * @returns {{ percentage: number, brandMatchRatio: number, matching: string[], differingA: string[], differingB: string[] }}
- */
-function calculateIngredientMatch(ingredientsA, ingredientsB) {
-  const listA = parseIngredients(ingredientsA);
-  const listB = parseIngredients(ingredientsB);
-
-  // ── Edge cases ──────────────────────────────────────────────────────────
-  if (listA.length === 0 && listB.length === 0) {
-    return {
-      percentage: 100,
-      brandMatchRatio: 100,
-      matching: [],
-      differingA: [],
-      differingB: [],
-    };
-  }
-  if (listA.length === 0 || listB.length === 0) {
-    return {
-      percentage: 0,
-      brandMatchRatio: 0,
-      matching: [],
-      differingA: listA,
-      differingB: listB,
-    };
-  }
-
-  const setA = new Set(listA);
-  const setB = new Set(listB);
-
-  // Intersection: ingredients that appear in both products
-  const intersection = new Set([...setA].filter((x) => setB.has(x)));
-
-  // Union: every unique ingredient across both products
-  const union = new Set([...setA, ...setB]);
-
-  // Jaccard coefficient = size of intersection / size of union
-  const jaccard = intersection.size / union.size;
-
-  // Brand-match ratio: how many of the brand's ingredients the alternative shares
-  const brandMatchRatio = intersection.size / setA.size;
-
-  return {
-    percentage: Math.round(jaccard * 100),
-    brandMatchRatio: Math.round(brandMatchRatio * 100),
-    matching: [...intersection].sort(),
-    differingA: [...setA].filter((x) => !setB.has(x)).sort(),
-    differingB: [...setB].filter((x) => !setA.has(x)).sort(),
-  };
-}
-
-/**
- * Returns the match threshold config for a given percentage score.
- *
- * Thresholds:
- *   ≥95%  → "Near Match"      (green)
- *   ≥80%  → "Very Similar"    (teal)
- *   ≥60%  → "Similar"         (amber)
- *   <60%  → "Different"       (red)
- *
- * @param {number} percentage - Match score (0–100).
- * @returns {{ label: string, icon: string, badgeClass: string, barColor: string }}
- */
-function getMatchThreshold(percentage) {
-  if (percentage >= 95)
-    return {
-      label: "Near Match",
-      icon: "🟢",
-      badgeClass: "bg-emerald-500 text-white",
-      barColor: "#10b981",
-    };
-  if (percentage >= 80)
-    return {
-      label: "Very Similar",
-      icon: "🔵",
-      badgeClass: "bg-teal-500 text-white",
-      barColor: "#14b8a6",
-    };
-  if (percentage >= 60)
-    return {
-      label: "Similar",
-      icon: "🟡",
-      badgeClass: "bg-amber-500 text-white",
-      barColor: "#f59e0b",
-    };
-  return {
-    label: "Different",
-    icon: "🔴",
-    badgeClass: "bg-red-500 text-white",
-    barColor: "#ef4444",
-  };
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  12.  FIND ALTERNATIVES                                                  ║
-// ║                                                                          ║
-// ║  Looks for products in the same category from other supermarkets.        ║
-// ║  Queries both Supabase (if available) and the local cache.               ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-/**
- * Searches for alternative products that share the same category as the
- * scanned product but come from a different supermarket.
- *
- * Results are scored by ingredient similarity and sorted best-first.
- *
- * @param {object} product            - The scanned product.
- * @param {string} preferredSupermarket - The user's selected supermarket ID.
- * @returns {Promise<object[]>} Array of alternative product objects, each
- *                              with a _match property containing the comparison.
- */
-async function findAlternatives(product, preferredSupermarket) {
-  const alternatives = [];
-
-  // ── Option 1: Query Supabase for same-category products ──────────────
-  if (supabase && product.category && product.category !== "Unknown") {
-    try {
-      const { data: rows, error } = await supabase
-        .from("products")
-        .select("*")
-        .eq("category", product.category)
-        .neq("barcode", product.barcode)
-        .limit(20);
-
-      if (!error && rows && rows.length > 0) {
-        rows.forEach((r) => alternatives.push(r));
-      }
-    } catch (err) {
-      console.warn("[AllVSame] Supabase alternatives query failed:", err);
-    }
-  }
-
-  // ── Option 2: Check the browser's local cache for same-category items ─
-  try {
-    const stored = localStorage.getItem(LOCAL_CACHE_KEY);
-    if (stored) {
-      const cache = JSON.parse(stored);
-      Object.values(cache).forEach((cached) => {
-        // Skip the scanned product itself
-        if (cached.barcode === product.barcode) return;
-
-        // Match by category if both have one
-        if (
-          product.category &&
-          product.category !== "Unknown" &&
-          cached.category &&
-          cached.category.toLowerCase() === product.category.toLowerCase()
-        ) {
-          // Avoid duplicates from Supabase results
-          if (!alternatives.some((a) => a.barcode === cached.barcode)) {
-            alternatives.push(cached);
-          }
-        }
-      });
-    }
-  } catch (err) {
-    console.warn("[AllVSame] Local cache alternatives scan failed:", err);
-  }
-
-  // ── Score each candidate by ingredient similarity ────────────────────
-  alternatives.forEach((alt) => {
-    alt._match = calculateIngredientMatch(
-      product.ingredients || "",
-      alt.ingredients || "",
-    );
-  });
-
-  // ── Sort: best match first, then lowest price ────────────────────────
-  alternatives.sort((a, b) => {
-    const scoreA = a._match?.percentage || 0;
-    const scoreB = b._match?.percentage || 0;
-    if (scoreB !== scoreA) return scoreB - scoreA;
-    return (a.price || Infinity) - (b.price || Infinity);
-  });
-
-  return alternatives;
-}
-
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  13.  UI RENDERERS                                                       ║
-// ║                                                                          ║
-// ║  renderResultsDashboard() — Builds the complete results view inside      ║
-// ║                              the <div id="results-display"> element.      ║
-// ║                                                                           ║
-// ║  showUserFallbackUI()     — Shows an error or informational alert card     ║
-// ║                              inside the <div id="results-display"> element.║
-// ║                                                                           ║
-// ║  Both functions use Tailwind CSS classes for a clean, modern look.        ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
 
 /**
  * Hides all major sections: idle, loading, error, and results display.
@@ -1053,9 +386,10 @@ function showIdleState() {
 }
 
 /**
- * Shows the loading spinner with custom messages.
- * @param {string} title   - Main loading text.
- * @param {string} subtext - Secondary description.
+ * Shows the loading spinner with a title and subtitle.
+ *
+ * @param {string} title   - Primary loading text.
+ * @param {string} subtext - Secondary loading text.
  */
 function showLoadingUI(title, subtext) {
   hideAllSections();
@@ -1065,8 +399,9 @@ function showLoadingUI(title, subtext) {
 }
 
 /**
- * Updates the loading text without hiding/re-showing the section.
- * @param {string} title   - New main text.
+ * Updates the loading text without hiding other sections.
+ *
+ * @param {string} title   - New primary text.
  * @param {string} subtext - New secondary text.
  */
 function updateLoadingUI(title, subtext) {
@@ -1075,9 +410,10 @@ function updateLoadingUI(title, subtext) {
 }
 
 /**
- * Shows the error state with a custom title and message.
- * @param {string} title   - Error heading.
- * @param {string} message - Error description.
+ * Shows a full-screen error state with a custom title and message.
+ *
+ * @param {string} title   - The error title.
+ * @param {string} message - The error description.
  */
 function showErrorState(title, message) {
   hideAllSections();
@@ -1086,7 +422,61 @@ function showErrorState(title, message) {
   if (DOM.error_message) DOM.error_message.textContent = message;
 }
 
-// ── MATCH THRESHOLD COLOURS (used by renderResultsDashboard) ──────────────
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  8.  UI RENDERERS                                                       ║
+// ║                                                                          ║
+// ║  renderResultsDashboard() — Builds the complete results view inside      ║
+// ║                              the <div id="results-display"> element.     ║
+// ║                                                                          ║
+// ║  showUserFallbackUI()     — Shows an error or informational alert card   ║
+// ║                              inside the <div id="results-display"> element.║
+// ║                                                                          ║
+// ║  Both functions use Tailwind CSS classes for a clean, modern look.       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+/**
+ * Returns the match threshold config for a given percentage score.
+ *
+ * Thresholds:
+ *   ≥95%  → "Near Match"      (green)
+ *   ≥80%  → "Very Similar"    (teal)
+ *   ≥60%  → "Similar"         (amber)
+ *   <60%  → "Different"       (red)
+ *
+ * @param {number} percentage - Match score (0–100).
+ * @returns {{ label: string, icon: string, badgeClass: string, barColor: string }}
+ */
+function getMatchThreshold(percentage) {
+  if (percentage >= 95)
+    return {
+      label: "Near Match",
+      icon: "",
+      badgeClass: "bg-emerald-500 text-white",
+      barColor: "#10b981",
+    };
+  if (percentage >= 80)
+    return {
+      label: "Very Similar",
+      icon: "",
+      badgeClass: "bg-teal-500 text-white",
+      barColor: "#14b8a6",
+    };
+  if (percentage >= 60)
+    return {
+      label: "Similar",
+      icon: "",
+      badgeClass: "bg-amber-500 text-white",
+      barColor: "#f59e0b",
+    };
+  return {
+    label: "Different",
+    icon: "",
+    badgeClass: "bg-red-500 text-white",
+    barColor: "#ef4444",
+  };
+}
+
+// ── MATCH THRESHOLD COLOURS ──────────────────────────────────────────────
 
 const MATCH_COLORS = {
   emerald: {
@@ -1112,7 +502,10 @@ const MATCH_COLORS = {
 };
 
 /**
- * Picks the right colour scheme for a given match percentage.
+ * Picks a colour scheme based on the match percentage.
+ *
+ * @param {number} pct - Match percentage (0–100).
+ * @returns {object} The colour config object from MATCH_COLORS.
  */
 function matchColorScheme(pct) {
   if (pct >= 95) return MATCH_COLORS.emerald;
@@ -1122,19 +515,11 @@ function matchColorScheme(pct) {
 }
 
 /**
- * Renders the full results dashboard inside the <div id="results-display"> element.
+ * Builds and injects the full results dashboard HTML into results-display.
  *
- * Builds the view as clean Tailwind CSS cards showing:
- *   - Scanned product card
- *   - Match badge & percentage
- *   - Alternative product card with savings callout
- *   - Ingredient comparison (match bar + matching/differing lists)
- *   - Price comparison table
- *   - Action buttons (Scan Another, View All Alternatives)
- *
- * @param {object} product    - The scanned (brand) product.
- * @param {object|null} alt   - The best alternative product (null if none found).
- * @param {object|null} comp  - Comparison result from calculateIngredientMatch().
+ * @param {object} product       - The scanned product data.
+ * @param {object|null} alt      - The best alternative product, or null.
+ * @param {object|null} comp     - The comparison result, or null.
  */
 function renderResultsDashboard(product, alt, comp) {
   hideAllSections();
@@ -1143,16 +528,13 @@ function renderResultsDashboard(product, alt, comp) {
   if (!el) return;
 
   el.classList.remove("hidden");
-  el.className = "space-y-4 animate-slide-up";
 
-  // ══════════════════════════════════════════════════════════════════════
-  //  BUILD THE HTML
-  // ══════════════════════════════════════════════════════════════════════
+  // ── BUILD THE HTML ────────────────────────────────────────────────────
 
   let html = "";
 
   // ── Scanned Product Card ─────────────────────────────────────────────
-  html += renderProductCardHtml(product, "Scanned Product", "📷");
+  html += renderProductCardHtml(product, "Scanned Product", "");
 
   // ── Match Badge & Alternative (if we found one) ──────────────────────
   if (alt && comp) {
@@ -1173,13 +555,13 @@ function renderResultsDashboard(product, alt, comp) {
     `;
 
     // Alternative Product Card
-    html += renderProductCardHtml(alt, "Best Alternative", "🛒", "emerald");
+    html += renderProductCardHtml(alt, "Best Alternative", "", "emerald");
 
     // Savings Callout
     if (savings > 0) {
       html += `
         <div class="bg-emerald-50 border border-emerald-200 rounded-2xl px-5 py-4 flex items-center gap-3 animate-fade-in">
-          <span class="text-2xl">💰</span>
+          <span class="text-2xl"></span>
           <div>
             <p class="text-xs font-bold text-emerald-700 uppercase tracking-wider">You could save</p>
             <p class="text-lg font-extrabold text-emerald-600">${formatPrice(savings)}</p>
@@ -1192,8 +574,8 @@ function renderResultsDashboard(product, alt, comp) {
     html += `
       <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden animate-fade-in">
         <div class="px-4 py-3 border-b border-slate-100">
-          <h3 class="text-sm font-bold text-slate-700 flex items-center gap-1.5">
-            <span>🧪</span> Ingredient Comparison
+          <h3 class="text-sm font-bold text-slate-700">
+            Ingredient Comparison
           </h3>
         </div>
 
@@ -1221,8 +603,8 @@ function renderResultsDashboard(product, alt, comp) {
     if (comp.matching.length > 0) {
       html += `
         <div>
-          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-emerald-600 mb-1.5 flex items-center gap-1">
-            <span>✅</span> Identical Ingredients
+          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-emerald-600 mb-1.5">
+            Identical Ingredients
             <span class="ml-auto text-xs font-normal text-slate-400">${comp.matching.length} items</span>
           </p>
           <div class="flex flex-wrap gap-1">
@@ -1236,8 +618,8 @@ function renderResultsDashboard(product, alt, comp) {
     if (comp.differingA.length > 0) {
       html += `
         <div>
-          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-amber-600 mb-1.5 flex items-center gap-1">
-            <span>⚠️</span> Only in Brand Product
+          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-amber-600 mb-1.5">
+            Only in Brand Product
             <span class="ml-auto text-xs font-normal text-slate-400">${comp.differingA.length} items</span>
           </p>
           <div class="flex flex-wrap gap-1">
@@ -1251,8 +633,8 @@ function renderResultsDashboard(product, alt, comp) {
     if (comp.differingB.length > 0) {
       html += `
         <div>
-          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-blue-600 mb-1.5 flex items-center gap-1">
-            <span>ℹ️</span> Only in Alternative
+          <p class="text-[0.65rem] font-semibold uppercase tracking-wider text-blue-600 mb-1.5">
+            Only in Alternative
             <span class="ml-auto text-xs font-normal text-slate-400">${comp.differingB.length} items</span>
           </p>
           <div class="flex flex-wrap gap-1">
@@ -1273,8 +655,8 @@ function renderResultsDashboard(product, alt, comp) {
 
       html += `
         <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 animate-fade-in">
-          <h3 class="text-sm font-bold text-slate-700 mb-3 flex items-center gap-1.5">
-            <span>💷</span> Price Comparison
+          <h3 class="text-sm font-bold text-slate-700 mb-3">
+            Price Comparison
           </h3>
           <div class="space-y-2">
             <div class="flex items-center justify-between text-sm py-2 border-b border-slate-50">
@@ -1310,8 +692,8 @@ function renderResultsDashboard(product, alt, comp) {
     if (state.alternatives.length > 1) {
       html += `
         <div id="all-alternatives" class="hidden space-y-2 animate-slide-up">
-          <h3 class="text-sm font-bold text-slate-700 flex items-center gap-1.5">
-            <span>📋</span> All Alternatives Found
+          <h3 class="text-sm font-bold text-slate-700">
+            All Alternatives Found
           </h3>
           <div id="alternatives-list" class="space-y-2">
             ${state.alternatives.map((a) => renderAltListItem(a, product)).join("")}
@@ -1323,7 +705,7 @@ function renderResultsDashboard(product, alt, comp) {
     // ── No alternative found ──────────────────────────────────────────
     html += `
       <div class="bg-amber-50 border border-amber-200 rounded-2xl p-5 text-center animate-fade-in">
-        <span class="text-3xl">🔍</span>
+        <span class="text-3xl"></span>
         <p class="text-sm font-bold text-amber-800 mt-2">No Alternatives Found</p>
         <p class="text-xs text-amber-600 mt-1 leading-relaxed">
           We couldn't find any products with similar ingredients in other supermarkets.
@@ -1339,25 +721,17 @@ function renderResultsDashboard(product, alt, comp) {
   // ── Inject the HTML ─────────────────────────────────────────────────
   el.innerHTML = html;
 
-  // ── Re-bind event listeners for dynamic buttons ─────────────────────
-  const scanBtn = document.getElementById("scan-another-btn");
-  if (scanBtn) scanBtn.addEventListener("click", resetForNewScan);
+  // ── Bind action buttons ─────────────────────────────────────────────
+  const scanAnotherBtn = document.getElementById("scan-another-btn");
+  if (scanAnotherBtn) scanAnotherBtn.addEventListener("click", resetForNewScan);
 
   const viewAltBtn = document.getElementById("view-alt-list-btn");
   if (viewAltBtn) {
     viewAltBtn.addEventListener("click", () => {
       const list = document.getElementById("all-alternatives");
-      if (list) {
-        list.classList.toggle("hidden");
-        viewAltBtn.textContent = list.classList.contains("hidden")
-          ? "View All Alternatives"
-          : "Hide Alternatives";
-      }
+      if (list) list.classList.toggle("hidden");
     });
   }
-
-  // ── Show the display ────────────────────────────────────────────────
-  el.classList.remove("hidden");
 }
 
 /**
@@ -1365,11 +739,11 @@ function renderResultsDashboard(product, alt, comp) {
  *
  * @param {object} product    - Product data.
  * @param {string} label      - Label text (e.g. "Scanned Product").
- * @param {string} fallbackEmoji - Emoji to show when no image is available.
+ * @param {string} fallbackText - Text to show when no image is available.
  * @param {string} [accent]   - Tailwind accent colour key (default: "brand").
  * @returns {string} HTML string.
  */
-function renderProductCardHtml(product, label, fallbackEmoji, accent) {
+function renderProductCardHtml(product, label, fallbackText, accent) {
   const accentText =
     accent === "emerald" ? "text-emerald-600" : "text-brand-600";
   const superInfo = product.supermarket
@@ -1377,13 +751,13 @@ function renderProductCardHtml(product, label, fallbackEmoji, accent) {
     : "Price comparison unavailable";
 
   const imageHtml = product.image_url
-    ? `<img src="${escapeHtml(product.image_url)}" alt="${escapeHtml(product.name || "Product")}" class="w-full h-full object-cover" onerror="this.parentElement.innerHTML='${fallbackEmoji}'" />`
-    : fallbackEmoji;
+    ? `<img src="${escapeHtml(product.image_url)}" alt="${escapeHtml(product.name || "Product")}" class="w-full h-full object-cover" onerror="this.parentElement.innerText=''"/>`
+    : fallbackText;
 
   return `
     <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 animate-fade-in">
-      <div class="flex items-start gap-3">
-        <div class="w-16 h-16 rounded-xl bg-slate-100 flex-shrink-0 overflow-hidden flex items-center justify-center text-2xl">
+      <div class="flex items-center gap-3">
+        <div class="w-16 h-16 rounded-xl bg-slate-100 flex-shrink-0 flex items-center justify-center text-xl overflow-hidden">
           ${imageHtml}
         </div>
         <div class="flex-1 min-w-0">
@@ -1414,8 +788,8 @@ function renderAltListItem(alt, brandProduct) {
       <div class="w-12 h-12 rounded-lg bg-slate-100 flex-shrink-0 flex items-center justify-center text-lg overflow-hidden">
         ${
           alt.image_url
-            ? `<img src="${escapeHtml(alt.image_url)}" alt="" class="w-full h-full object-cover" onerror="this.parentElement.innerHTML='🛒'" />`
-            : "🛒"
+            ? `<img src="${escapeHtml(alt.image_url)}" alt="" class="w-full h-full object-cover" onerror="this.parentElement.innerText=''" />`
+            : ""
         }
       </div>
       <div class="flex-1 min-w-0">
@@ -1432,11 +806,9 @@ function renderAltListItem(alt, brandProduct) {
 }
 
 /**
- * Shows a user-friendly fallback UI (error / info / success) inside
- * the <div id="results-display"> element using a Tailwind CSS alert card.
+ * Shows a fallback UI message (error / info / success) inside results-display.
  *
- * @param {string} message - The message to display. HTML is allowed for
- *                           basic formatting (bold, italics).
+ * @param {string} message - The message text (HTML allowed).
  * @param {'error'|'info'|'success'} type - The type of alert to show.
  */
 function showUserFallbackUI(message, type) {
@@ -1449,21 +821,21 @@ function showUserFallbackUI(message, type) {
     error: {
       border: "border-red-200",
       bg: "bg-red-50",
-      icon: "⚠️",
+      icon: "",
       title: "red-700",
       text: "red-600",
     },
     info: {
       border: "border-blue-200",
       bg: "bg-blue-50",
-      icon: "ℹ️",
+      icon: "",
       title: "blue-700",
       text: "blue-600",
     },
     success: {
       border: "border-emerald-200",
       bg: "bg-emerald-50",
-      icon: "✅",
+      icon: "",
       title: "emerald-700",
       text: "emerald-600",
     },
@@ -1474,9 +846,6 @@ function showUserFallbackUI(message, type) {
   el.className = "animate-fade-in";
   el.innerHTML = `
     <div class="${s.bg} border ${s.border} rounded-2xl p-5 text-center shadow-sm">
-      <div class="w-12 h-12 rounded-full bg-white/80 flex items-center justify-center mx-auto mb-3 shadow-sm">
-        <span class="text-2xl">${s.icon}</span>
-      </div>
       <p class="text-sm font-bold text-${s.title}">${type === "error" ? "Something went wrong" : type === "success" ? "Success" : "Heads up"}</p>
       <p class="text-xs text-${s.text} mt-1.5 leading-relaxed">${message}</p>
       <button id="fallback-retry-btn" class="mt-4 text-sm font-semibold text-brand-600 bg-white hover:bg-brand-50 active:scale-95 px-6 py-2.5 rounded-xl transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-brand-400 border border-slate-200">
@@ -1493,32 +862,21 @@ function showUserFallbackUI(message, type) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  14.  SCAN HISTORY                                                       ║
+// ║  9.  SCAN HISTORY                                                       ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
- * Loads the scan history array from localStorage.
- */
-function loadScanHistory() {
-  try {
-    const stored = localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (stored) state.scanHistory = JSON.parse(stored);
-  } catch (err) {
-    console.warn("[AllVSame] Could not load scan history:", err);
-    state.scanHistory = [];
-  }
-}
-
-/**
- * Adds a product to the front of the scan history (deduplicated by barcode).
- * Persists to localStorage. Keeps at most 50 entries.
+ * Adds a product to the scan history (in-memory + localStorage).
  *
- * @param {object} product - The scanned product.
+ * @param {object} product - The product data to record.
  */
 function addToScanHistory(product) {
-  // Remove existing entry for the same barcode (if any)
-  const idx = state.scanHistory.findIndex((p) => p.barcode === product.barcode);
-  if (idx !== -1) state.scanHistory.splice(idx, 1);
+  if (!product || !product.barcode) return;
+
+  // Remove existing entry with same barcode (to move it to the top)
+  state.scanHistory = state.scanHistory.filter(
+    (h) => h.barcode !== product.barcode,
+  );
 
   // Add to front
   state.scanHistory.unshift({
@@ -1548,6 +906,20 @@ function addToScanHistory(product) {
 }
 
 /**
+ * Loads the scan history from localStorage on startup.
+ */
+function loadScanHistory() {
+  try {
+    const stored = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (stored) {
+      state.scanHistory = JSON.parse(stored);
+    }
+  } catch (err) {
+    console.warn("[AllVSame] Could not load scan history:", err);
+  }
+}
+
+/**
  * Renders the scan history panel with clickable items.
  */
 function renderScanHistory() {
@@ -1556,7 +928,6 @@ function renderScanHistory() {
   if (state.scanHistory.length === 0) {
     DOM.history_list.innerHTML = `
       <div class="flex flex-col items-center justify-center py-12 text-slate-400">
-        <span class="text-3xl mb-2">🕐</span>
         <p class="text-sm font-medium">No scans yet</p>
         <p class="text-xs mt-0.5">Scan a product to see it here</p>
       </div>
@@ -1570,7 +941,7 @@ function renderScanHistory() {
       (item) => `
       <div class="flex items-center gap-3 py-2.5 border-b border-slate-50 cursor-pointer hover:bg-slate-50 rounded-lg px-2 transition-colors" data-barcode="${escapeHtml(item.barcode)}">
         <div class="w-10 h-10 rounded-lg bg-slate-100 flex-shrink-0 flex items-center justify-center text-base overflow-hidden">
-          ${item.image_url ? `<img src="${escapeHtml(item.image_url)}" alt="" class="w-full h-full object-cover" />` : "🏷️"}
+          ${item.image_url ? `<img src="${escapeHtml(item.image_url)}" alt="" class="w-full h-full object-cover" />` : ""}
         </div>
         <div class="flex-1 min-w-0">
           <p class="text-sm font-semibold text-slate-700 truncate">${escapeHtml(item.name || "Unknown")}</p>
@@ -1595,7 +966,7 @@ function renderScanHistory() {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  15.  UI UTILITIES                                                       ║
+// ║  10.  UI UTILITIES                                                       ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
@@ -1684,7 +1055,7 @@ function closeAllPanels() {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  16.  BARCODE SCANNER (html5-qrcode)                                     ║
+// ║  11.  BARCODE SCANNER (html5-qrcode)                                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
@@ -1706,13 +1077,119 @@ function initScanner() {
   }
 }
 
+// ── Camera Permission Manager ────────────────────────────────────────────
+//
+//  The browser only allows camera access after the user has explicitly
+//  granted it via a permission prompt. This manager:
+//
+//    1. Requests camera access via getUserMedia() BEFORE the scanner
+//       starts, so the permission prompt is shown cleanly.
+//    2. Saves a flag in localStorage once permission is granted.
+//    3. On the next visit, checks the stored flag and the Permissions
+//       API to decide whether to auto-start the camera.
+
+/**
+ * Explicitly requests camera access by calling getUserMedia.
+ * This is what triggers the browser's permission prompt.
+ *
+ * @returns {Promise<boolean>} True if permission was granted.
+ */
+async function requestCameraPermission() {
+  // Check the Permissions API first — skip the prompt if already granted
+  if (navigator.permissions && navigator.permissions.query) {
+    try {
+      const status = await navigator.permissions.query({ name: "camera" });
+      if (status.state === "granted") {
+        return true;
+      }
+    } catch (_) {
+      // Permissions API unavailable — fall through to getUserMedia
+    }
+  }
+
+  // Request camera access explicitly. This triggers the browser's prompt.
+  let tempStream = null;
+  try {
+    tempStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false,
+    });
+    tempStream.getTracks().forEach((t) => t.stop());
+    return true;
+  } catch (err) {
+    if (tempStream) tempStream.getTracks().forEach((t) => t.stop());
+    console.warn("[AllVSame] Camera permission denied:", err.message);
+    return false;
+  }
+}
+
+/**
+ * Saves a flag to localStorage so we know the user previously granted
+ * camera access. On their next visit we can try to auto-start the scanner.
+ */
+function saveCameraPermissionGranted() {
+  try {
+    localStorage.setItem(CAMERA_PERMISSION_KEY, "granted");
+  } catch (_) {}
+}
+
+/**
+ * Removes the stored camera permission flag.
+ */
+function clearCameraPermissionFlag() {
+  try {
+    localStorage.removeItem(CAMERA_PERMISSION_KEY);
+  } catch (_) {}
+}
+
+/**
+ * Checks whether the user previously granted camera access.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function checkSavedCameraPermission() {
+  const flag = localStorage.getItem(CAMERA_PERMISSION_KEY);
+  if (flag !== "granted") return false;
+
+  if (navigator.permissions && navigator.permissions.query) {
+    try {
+      const status = await navigator.permissions.query({ name: "camera" });
+      if (status.state === "denied") {
+        clearCameraPermissionFlag();
+        return false;
+      }
+      if (status.state === "granted") return true;
+      return true;
+    } catch (_) {
+      return true;
+    }
+  }
+  return true;
+}
+
 /**
  * Starts the camera and begins barcode detection.
+ * Requests camera permission first, then initialises the scanner.
  */
 async function startScanner() {
+  // ── Step 1: Request camera permission explicitly ────────────────
+  const permitted = await requestCameraPermission();
+  if (!permitted) {
+    showToast(
+      "Camera access is required to scan barcodes. Please allow camera access in your browser settings.",
+      "error",
+    );
+    return;
+  }
+
+  // ── Step 2: Permission confirmed — save the flag ────────────────
+  saveCameraPermissionGranted();
+
+  // ── Step 3: Initialise the scanner if not already done ──────────
   if (!state.scanner) initScanner();
   if (!state.scanner || state.isScanning) return;
 
+  // ── Step 4: Start the scanner ───────────────────────────────────
   try {
     DOM.scanner_placeholder.classList.add("hidden");
     DOM.scanning_dot.classList.remove("hidden");
@@ -1780,8 +1257,6 @@ function toggleScanner() {
 
 /**
  * Callback when a barcode is successfully decoded.
- * Validates the barcode length, stops the scanner, and calls
- * handleProductScan().
  *
  * @param {string} decodedText - Raw barcode string.
  */
@@ -1799,7 +1274,7 @@ function onBarcodeDetected(decodedText) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  17.  EVENT HANDLERS                                                     ║
+// ║  12.  EVENT HANDLERS                                                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
@@ -1835,19 +1310,11 @@ function bindEvents() {
     }
   });
 
-  // ── Error state retry ─────────────────────────────────────
-  DOM.error_retry_btn?.addEventListener("click", () => {
-    showIdleState();
-    if (DOM.manual_barcode) DOM.manual_barcode.value = "";
-  });
-
-  // ── Bottom navigation ─────────────────────────────────────
+  // ── Nav tab switching ─────────────────────────────────────
   DOM.navBtns?.forEach((btn) => {
     btn.addEventListener("click", () => {
-      const tab = btn.getAttribute("data-tab");
-
+      const tab = btn.dataset.tab;
       if (tab === "scan") {
-        closeAllPanels();
         DOM.scanner_section?.scrollIntoView({ behavior: "smooth" });
       } else if (tab === "history") {
         openPanel("history");
@@ -1855,7 +1322,7 @@ function bindEvents() {
         openPanel("about");
       }
 
-      // Update active nav styling
+      // Update active tab styling
       DOM.navBtns.forEach((b) => {
         b.querySelector("span:first-child")?.classList.remove("text-brand-600");
         b.querySelector("span:first-child")?.classList.add("text-slate-400");
@@ -1932,7 +1399,7 @@ function resetForNewScan() {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  18.  INITIALISATION                                                     ║
+// ║  13.  INITIALISATION                                                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 /**
@@ -1942,11 +1409,22 @@ function initApp() {
   console.log("[AllVSame] Initialising…");
 
   cacheDomRefs();
-  initSupabase();
   initScanner();
   loadScanHistory();
   bindEvents();
   showIdleState();
+
+  // ── Auto-start scanner if user previously granted camera access ──
+  setTimeout(async () => {
+    const canAutoStart = await checkSavedCameraPermission();
+    if (canAutoStart) {
+      console.log(
+        "[AllVSame] Camera permission previously granted — auto-starting scanner",
+      );
+      if (DOM.loading_text) DOM.loading_text.textContent = "Resuming camera…";
+      await startScanner();
+    }
+  }, 300);
 
   console.log("[AllVSame] Application ready");
 }
@@ -1959,15 +1437,14 @@ if (document.readyState === "loading") {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  19.  DEBUGGING HELPERS                                                  ║
+// ║  14.  DEBUGGING HELPERS                                                  ║
 // ║                                                                          ║
 // ║  Exposed on window.avs so you can test from the browser console:         ║
-// ║                                                                           ║
-// ║    window.avs.lookup("5012345678900")   — manual barcode lookup            ║
-// ║    window.avs.compare("a, b, c", "a, d") — test ingredient comparison      ║
-// ║    window.avs.reset()                   — reset the UI                     ║
-// ║    window.avs.state                     — view the full app state          ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ║                                                                          ║
+// ║    window.avs.lookup("5012345678900")   — manual barcode lookup           ║
+// ║    window.avs.state                     — view the full app state         ║
+// ║    window.avs.reset()                   — reset the UI                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
 
 if (typeof window !== "undefined") {
   window.avs = {
@@ -1978,19 +1455,7 @@ if (typeof window !== "undefined") {
           state.selectedSupermarket,
         );
     },
-    compare: (ingA, ingB) => {
-      const r = calculateIngredientMatch(ingA, ingB);
-      console.table(r);
-      return r;
-    },
     reset: resetForNewScan,
     state: state,
-    supabase: () => supabase,
   };
 }
-
-/**
- * ═══════════════════════════════════════════════════════════════════════════
- *  END OF AllVSame APPLICATION LOGIC
- * ═══════════════════════════════════════════════════════════════════════════
- */

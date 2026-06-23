@@ -1,2 +1,5 @@
 node_modules/
 .DS_Store
+
+# Supabase CLI temporary files
+supabase/.temp/
