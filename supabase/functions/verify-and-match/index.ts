@@ -154,6 +154,7 @@ interface ProductData {
   brand: string;
   supermarket: string;
   category: string;
+  categoriesTags?: string[]; // OFF taxonomy tags (e.g. "en:biscuits") -- used for Tier 2 search fallback
   ingredients: string;
   price: number | null;
   image_url: string;
@@ -249,6 +250,19 @@ async function fetchFromOpenFoodFacts(
   // Extract categories -- OFF uses a taxonomy like "Colas, pt:bebidas cafeina"
   const categories = (p.categories || "").trim();
 
+  // Extract OFF category taxonomy tags (e.g. ["en:biscuits", "en:chocolate-biscuits"])
+  // These are used by the Tier 2 search fallback to generate broader keywords.
+  let categoriesTags: string[] = [];
+  if (Array.isArray(p.categories_tags)) {
+    categoriesTags = p.categories_tags.filter(
+      (tag: string) => typeof tag === "string" && tag.startsWith("en:"),
+    );
+  } else if (Array.isArray(p.categories_hierarchy)) {
+    categoriesTags = p.categories_hierarchy.filter(
+      (tag: string) => typeof tag === "string" && tag.startsWith("en:"),
+    );
+  }
+
   // Extract brand(s) -- can be comma-separated; take the first one
   let brand = "Unknown Brand";
   if (p.brands && typeof p.brands === "string") {
@@ -269,6 +283,7 @@ async function fetchFromOpenFoodFacts(
     brand,
     supermarket: "unknown",
     category: categories || "Unknown",
+    categoriesTags: categoriesTags.length > 0 ? categoriesTags : undefined,
     ingredients: ingredientsText,
     price: null, // OFF does not provide price data
     image_url: imageUrl,
@@ -513,18 +528,23 @@ function extractProductFromApifyItem(
  * Uses the synchronous Apify endpoint (/run-sync-get-dataset-items) which
  * runs the actor and blocks until results are ready -- no polling needed.
  *
+ * Returns ALL results from the dataset so the caller can inspect them for
+ * own-brand matches. The tiered fallback logic uses this to determine
+ * whether to re-search with a broader category keyword.
+ *
  * @param barcode      The scanned product barcode (used as search query).
  * @param supermarket  The supermarket ID (tesco, sainsburys, asda, morrisons).
  * @param productHint  The product name from Phase B (for keyword cleaning).
  * @param brandHint    The brand name from Phase B (for keyword cleaning).
- * @returns            A ProductData object, or null if scraping failed.
+ * @returns            Array of ProductData results (may be empty), or null if the
+ *                     request itself failed (network error, auth error, etc.).
  */
 async function scrapeSupermarketProduct(
   barcode: string,
   supermarket: string,
   productHint: string,
   brandHint: string,
-): Promise<ProductData | null> {
+): Promise<ProductData[] | null> {
   if (!APIFY_TOKEN) {
     console.warn("[verify-and-match] APIFY_TOKEN not set in environment");
     return null;
@@ -586,16 +606,22 @@ async function scrapeSupermarketProduct(
     console.warn(
       `[verify-and-match] Apify: no results for "${keyword}" on ${supermarket}`,
     );
-    return null;
+    return []; // Return empty array -- no results, but request succeeded
   }
 
-  // Use the first (best) result
-  const product = extractProductFromApifyItem(dataset[0], barcode, supermarket);
-  console.log(
-    `[verify-and-match] Apify: found "${product.name}" at ${supermarket} for GBP ${product.price}`,
+  // Return ALL results so the caller can inspect each for own-brand status
+  const products = dataset.map((item: any) =>
+    extractProductFromApifyItem(item, barcode, supermarket),
   );
 
-  return product;
+  console.log(
+    `[verify-and-match] Apify: found ${products.length} result(s) for "${keyword}" on ${supermarket}`,
+  );
+  products.forEach((p: ProductData) => {
+    console.log(`  -> "${p.name}" (brand: "${p.brand}", GBP ${p.price})`);
+  });
+
+  return products;
 }
 
 /**
@@ -679,7 +705,422 @@ async function scrapeAllSupermarketsFallback(
 }
 
 // =============================================================================
-//  8.  INGREDIENT COMPARISON ENGINE (Phase D & E)
+//  8A.  TIER 1 + TIER 2 -- MULTI-TIER SEARCH FALLBACK STRATEGY
+// =============================================================================
+//
+//  PROBLEM:
+//    Searching for a brand name like "Oreo" on Tesco only returns branded Oreo
+//    products. The supermarket's generic equivalent is named "Cookies & Cream
+//    Biscuits" -- a completely different string. Our Tier 1 search misses it.
+//
+//  SOLUTION (Tier 1 -> Tier 2):
+//    Tier 1: Search with the cleaned brand product name (e.g. "Oreo Double Cream")
+//    Tier 2: If Tier 1 returns results but NONE are supermarket own-brand, extract
+//            the product's category from Open Food Facts tags, map them to plain
+//            English product-type keywords (e.g. "en:chocolate-sandwich-biscuit"
+//            -> "Chocolate Sandwich Biscuits"), and re-run the Apify scraper.
+//            Filter for supermarket own-brand items in the results.
+
+/**
+ * Detects whether a product result is a supermarket's own brand.
+ *
+ * A product is considered "own brand" if:
+ *   1. The brand field contains the supermarket name (e.g. "Tesco", "Asda")
+ *   2. The product name starts with the supermarket name
+ *   3. The brand is not a known branded manufacturer
+ *
+ * Known branded manufacturers are household names whose products have generic
+ * equivalents (Oreo, Pringles, Nutella, Heinz, Kellogg's, etc.).
+ *
+ * @param product     The product to check.
+ * @param supermarket The supermarket ID (tesco, sainsburys, asda, morrisons).
+ * @returns           true if the product appears to be supermarket own brand.
+ */
+function isOwnBrandProduct(product: ProductData, supermarket: string): boolean {
+  // Known branded manufacturers whose supermarket equivalents we want to find
+  const KNOWN_BRANDS = [
+    "oreo",
+    "pringles",
+    "nutella",
+    "heinz",
+    "kellogg",
+    "nestle",
+    "cadbury",
+    "pepsi",
+    "coca-cola",
+    "walkers",
+    "doritos",
+    "m&m",
+    "mars",
+    "snickers",
+    "twix",
+    "kitkat",
+    "haribo",
+    "danone",
+    "muller",
+    "yoplait",
+    "ben & jerry",
+    "haagen-dazs",
+    "maggi",
+    "bisto",
+    "oxo",
+    "colgate",
+    "persil",
+    "fairy",
+    "cif",
+    "ajax",
+    "dove",
+    "nivea",
+    "gillette",
+    "pampers",
+    "huggies",
+    "whiskas",
+    "pedigree",
+    "felix",
+    "iams",
+    "lindt",
+    "galaxy",
+    "mcvities",
+    "jordans",
+    "ryvita",
+    "hovis",
+    "warburtons",
+    "kingsmill",
+    "robin",
+  ];
+
+  const supermarketName =
+    supermarket.charAt(0).toUpperCase() + supermarket.slice(1);
+  const nameLower = (product.name || "").toLowerCase();
+  const brandLower = (product.brand || "").toLowerCase();
+
+  // Check 1: Brand field contains the supermarket name
+  if (
+    brandLower.includes(supermarket) ||
+    brandLower.includes(supermarketName)
+  ) {
+    return true;
+  }
+
+  // Check 2: Product name starts with the supermarket name (e.g. "Tesco Cola")
+  if (
+    nameLower.startsWith(supermarket) ||
+    nameLower.startsWith(supermarketName)
+  ) {
+    return true;
+  }
+
+  // Check 3: Brand is NOT a known branded manufacturer
+  //          (if brand is empty/unknown, treat as possibly own brand)
+  if (!brandLower || brandLower === "unknown brand") {
+    return true;
+  }
+
+  const isKnownBrand = KNOWN_BRANDS.some((kb) => brandLower.includes(kb));
+  if (!isKnownBrand) {
+    // Unknown brand that is not the supermarket -- could be a third-party own brand
+    // We treat this as a weak own-brand match if the product name looks generic
+    const genericIndicators = [
+      supermarket,
+      supermarketName,
+      "value",
+      "everyday",
+      "essential",
+      "savers",
+      "own",
+      "selected",
+      "basics",
+      "budget",
+    ];
+    const hasGenericName = genericIndicators.some((ind) =>
+      nameLower.includes(ind),
+    );
+    if (hasGenericName) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Maps Open Food Facts category taxonomy tags to plain English search keywords.
+ *
+ * OFF uses a hierarchical taxonomy like "en:biscuits", "en:chocolate-sandwich-biscuit".
+ * This function converts those into search terms that a UK supermarket search bar
+ * would understand (e.g. "Chocolate Sandwich Biscuits", "Cream Biscuits").
+ *
+ * @param categoriesTags  Array of OFF category tags (e.g. ["en:biscuits", "en:chocolate-sandwich-biscuit"]).
+ * @param categories      Free-text categories string as a fallback (e.g. "Biscuits, Chocolate biscuits").
+ * @returns               Array of English search keywords, most specific first.
+ */
+function categoriesToKeywords(
+  categoriesTags: string[] | undefined,
+  categories: string,
+): string[] {
+  const keywords: string[] = [];
+
+  // ---- Step 1: Map known OFF taxonomy tags to English keywords ----
+  //    Each entry maps from a tag pattern to one or more search keywords.
+  //    More specific tags are listed first so they appear earlier in the results.
+  const TAG_MAP: Record<string, string[]> = {
+    "en:biscuits": ["Biscuits", "Cookies"],
+    "en:chocolate-biscuits": ["Chocolate Biscuits", "Chocolate Cookies"],
+    "en:cream-biscuit": ["Cream Biscuits"],
+    "en:sandwich-biscuit": ["Sandwich Biscuits", "Cream Biscuits"],
+    "en:chocolate-sandwich-biscuit": [
+      "Chocolate Sandwich Biscuits",
+      "Chocolate Cream Biscuits",
+    ],
+    "en:biscuit-with-chocolate": ["Chocolate Biscuits", "Chocolate Cookies"],
+    "en:shortbread-biscuit": ["Shortbread Biscuits"],
+    "en:cookie": ["Cookies", "Cookie"],
+    "en:chocolate-cookie": ["Chocolate Cookies", "Chocolate Chip Cookies"],
+    "en:cream-cookie": ["Cream Cookies", "Sandwich Cookies"],
+    "en:chocolate-sandwich-cookie": ["Chocolate Sandwich Cookies"],
+    "en:waffle": ["Waffles", "Waffle Biscuits"],
+    "en:wafer": ["Wafers", "Wafer Biscuits"],
+    "en:chocolate-wafer": ["Chocolate Wafers"],
+    "en:cereal": ["Cereal", "Breakfast Cereal"],
+    "en:breakfast-cereal": ["Breakfast Cereal", "Cereal"],
+    "en:chocolate": ["Chocolate"],
+    "en:confectionery": ["Confectionery", "Sweets"],
+    "en:chocolate-confectionery": ["Chocolate Confectionery"],
+    "en:snacks": ["Snacks", "Crisps"],
+    "en:crisps": ["Crisps", "Potato Crisps"],
+    "en:potato-crisps": ["Potato Crisps", "Crisps"],
+    "en:tortilla-chips": ["Tortilla Chips", "Corn Chips"],
+    "en:spread": ["Spread", "Chocolate Spread"],
+    "en:chocolate-spread": ["Chocolate Spread", "Hazelnut Spread"],
+    "en:hazelnut-spread": ["Hazelnut Spread", "Chocolate Hazelnut Spread"],
+    "en:jams": ["Jam", "Marmalade", "Preserves"],
+    "en:pasta": ["Pasta", "Pasta Sauce"],
+    "en:pasta-sauce": ["Pasta Sauce", "Tomato Sauce"],
+    "en:soup": ["Soup"],
+    "en:tomato-soup": ["Tomato Soup"],
+    "en:baked-beans": ["Baked Beans"],
+    "en:beans": ["Beans", "Baked Beans"],
+    "en:tuna": ["Tuna", "Canned Tuna"],
+    "en:canned-fish": ["Canned Fish", "Tuna"],
+    "en:mayonnaise": ["Mayonnaise", "Mayo"],
+    "en:ketchup": ["Ketchup", "Tomato Ketchup"],
+    "en:sauce": ["Sauce"],
+    "en:tomato-sauce": ["Tomato Sauce"],
+    "en:yogurt": ["Yogurt", "Yoghurt"],
+    "en:fruit-yogurt": ["Fruit Yogurt", "Yogurt"],
+    "en:cheese": ["Cheese"],
+    "en:cheddar-cheese": ["Cheddar Cheese"],
+    "en:milk": ["Milk"],
+    "en:butter": ["Butter"],
+    "en:margarine": ["Margarine", "Spread"],
+    "en:bread": ["Bread"],
+    "en:white-bread": ["White Bread"],
+    "en:wholemeal-bread": ["Wholemeal Bread", "Whole Wheat Bread"],
+    "en:drinks": ["Drinks", "Soft Drinks"],
+    "en:carbonated-drinks": ["Carbonated Drinks", "Cola", "Fizzy Drinks"],
+    "en:colas": ["Cola", "Carbonated Drinks"],
+    "en:water": ["Water", "Spring Water"],
+    "en:fruit-juice": ["Fruit Juice", "Juice"],
+    "en:rice": ["Rice"],
+    "en:pasta": ["Pasta"],
+    "en:noodles": ["Noodles"],
+    "en:potatoes": ["Potatoes"],
+    "en:oven-chips": ["Oven Chips", "Potato Products"],
+    "en:frozen-potato-products": ["Frozen Potato Products", "Chips"],
+    "en:pizza": ["Pizza"],
+    "en:ice-cream": ["Ice Cream", "Ice Cream Desserts"],
+    "en:vanilla-ice-cream": ["Vanilla Ice Cream"],
+    "en:chocolate-ice-cream": ["Chocolate Ice Cream"],
+  };
+
+  // Check each known tag (most specific first -- OFF tags are ordered specific to generic)
+  if (categoriesTags && categoriesTags.length > 0) {
+    // Use the most specific tags (last ones in the array are more generic)
+    // We iterate from most specific (first) to most generic (last)
+    for (const tag of categoriesTags) {
+      const tagLower = tag.toLowerCase();
+      // Direct match
+      if (TAG_MAP[tagLower]) {
+        for (const kw of TAG_MAP[tagLower]) {
+          if (!keywords.includes(kw)) keywords.push(kw);
+        }
+      }
+      // Partial match -- extract the last meaningful part of the tag
+      // e.g. "en:chocolate-sandwich-biscuit" -> parts: ["chocolate", "sandwich", "biscuit"]
+      const parts = tagLower.replace("en:", "").split(/[-_]/);
+      if (parts.length >= 2) {
+        // Capitalise each part and join
+        const derived = parts
+          .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+          .join(" ");
+        if (!keywords.includes(derived)) keywords.push(derived);
+      }
+    }
+  }
+
+  // ---- Step 2: Fall back to the free-text categories field ----
+  //    If OFF has no tags, parse the human-readable categories string.
+  //    E.g. "Biscuits and cakes, Biscuits, Chocolate biscuits"
+  //    -> extract meaningful product-type words.
+  if (keywords.length === 0 && categories) {
+    const categoryParts = categories
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    for (const part of categoryParts) {
+      // Remove generic taxonomical prefixes like "en:", "pt:", "fr:"
+      const cleaned = part.replace(/^[a-z]{2}:/, "").trim();
+      if (cleaned && cleaned.length > 3) {
+        // Capitalise first letter
+        const formatted = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+        if (!keywords.includes(formatted)) keywords.push(formatted);
+      }
+    }
+  }
+
+  // ---- Step 3: Absolute fallback ----
+  if (keywords.length === 0) {
+    keywords.push("Biscuits", "Cookies", "Snacks");
+  }
+
+  // Return unique keywords, limiting to the 5 most specific
+  return [...new Set(keywords)].slice(0, 5);
+}
+
+/**
+ * Multi-Tier Search Fallback: attempts to find a supermarket own-brand product
+ * using progressively broader search keywords.
+ *
+ * STRATEGY:
+ *   Tier 1: Search with the cleaned brand product name (e.g. "Oreo Double Cream").
+ *   -> If results contain a supermarket own-brand item, return it immediately.
+ *   -> If results exist but none are own-brand, proceed to Tier 2.
+ *
+ *   Tier 2: Extract OFF category tags, map to plain English keywords (e.g.
+ *   "en:chocolate-sandwich-biscuit" -> "Chocolate Sandwich Biscuits"), then
+ *   re-run the Apify scraper with each category keyword. Return the first
+ *   own-brand match found.
+ *
+ *   Fallback: If both tiers fail to find an own-brand match, return the best
+ *   Tier 1 result (even if branded) so the user still gets data.
+ *
+ * @param barcode          The scanned barcode.
+ * @param supermarket      The user's selected supermarket (tesco, sainsburys, etc.).
+ * @param productHint      The product name from Phase B (for keyword cleaning).
+ * @param brandHint        The brand name from Phase B (for keyword cleaning).
+ * @param categoriesTags   OFF taxonomy tags from Phase B (e.g. ["en:biscuits"]).
+ * @param categories       Free-text categories string from Phase B.
+ * @returns                The best matching ProductData, or null if nothing found.
+ */
+async function searchWithTieredFallback(
+  barcode: string,
+  supermarket: string,
+  productHint: string,
+  brandHint: string,
+  categoriesTags: string[] | undefined,
+  categories: string,
+): Promise<ProductData | null> {
+  // ---- TIER 1: Specific Brand Search ----
+  //     Search with the cleaned product name (e.g. "Oreo Double Cream")
+  const tier1Keyword = cleanSearchKeyword(productHint, brandHint);
+  console.log(
+    `[tiered-fallback] TIER 1: searching "${supermarket}" for "${tier1Keyword}"`,
+  );
+
+  const tier1Results = await scrapeSupermarketProduct(
+    barcode,
+    supermarket,
+    productHint,
+    brandHint,
+  );
+
+  // Check if Tier 1 returned any own-brand products
+  if (tier1Results && tier1Results.length > 0) {
+    const ownBrand = tier1Results.find((p) =>
+      isOwnBrandProduct(p, supermarket),
+    );
+    if (ownBrand) {
+      console.log(
+        `[tiered-fallback] TIER 1: found own-brand match -> "${ownBrand.name}"`,
+      );
+      return ownBrand;
+    }
+
+    console.log(
+      `[tiered-fallback] TIER 1: found ${tier1Results.length} result(s), but NONE are own-brand.`,
+    );
+    console.log(
+      `[tiered-fallback] TIER 1: best branded result -> "${tier1Results[0].name}"`,
+    );
+
+    // If Tier 1 found branded results but we have no category info to fall back on,
+    // return the best branded result rather than nothing.
+    if (
+      (!categoriesTags || categoriesTags.length === 0) &&
+      (!categories || categories === "Unknown")
+    ) {
+      console.log(
+        `[tiered-fallback] No category data available, returning best branded result.`,
+      );
+      return tier1Results[0];
+    }
+  } else {
+    console.log(`[tiered-fallback] TIER 1: no results found.`);
+  }
+
+  // ---- TIER 2: Category-Broadened Search ----
+  //     Map OFF category tags to plain English keywords and re-search.
+  const broadKeywords = categoriesToKeywords(categoriesTags, categories);
+  console.log(
+    `[tiered-fallback] TIER 2: trying keywords: [${broadKeywords.join(", ")}]`,
+  );
+
+  for (const keyword of broadKeywords) {
+    console.log(
+      `[tiered-fallback] TIER 2: searching "${supermarket}" for "${keyword}"`,
+    );
+
+    const tier2Results = await scrapeSupermarketProduct(
+      barcode,
+      supermarket,
+      keyword, // Use the category keyword directly (no brand to strip)
+      "", // No brand hint for category searches
+    );
+
+    if (tier2Results && tier2Results.length > 0) {
+      // Prefer own-brand matches
+      const ownBrand = tier2Results.find((p) =>
+        isOwnBrandProduct(p, supermarket),
+      );
+      if (ownBrand) {
+        console.log(
+          `[tiered-fallback] TIER 2: found own-brand match -> "${ownBrand.name}"`,
+        );
+        return ownBrand;
+      }
+
+      // If we found any result in Tier 2, return the best one
+      // (it's a category-relevant product even if not own-brand)
+      console.log(
+        `[tiered-fallback] TIER 2: found "${tier2Results[0].name}" for keyword "${keyword}"`,
+      );
+      return tier2Results[0];
+    }
+  }
+
+  // ---- FINAL FALLBACK: Return Tier 1's best result if available ----
+  if (tier1Results && tier1Results.length > 0) {
+    console.log(
+      `[tiered-fallback] All tiers exhausted, returning best Tier 1 result (branded).`,
+    );
+    return tier1Results[0];
+  }
+
+  console.log(`[tiered-fallback] No results found in any tier.`);
+  return null;
+}
+
+// =============================================================================
+//  8B.  INGREDIENT COMPARISON ENGINE (Phase D & E)
 // =============================================================================
 //
 //  Uses Jaccard similarity on normalised tokens. Both the brand product
@@ -890,39 +1331,91 @@ async function findAlternatives(
 ): Promise<any[]> {
   const alternatives: any[] = [];
 
-  // Only query if we have a category and a database client
   if (!supabaseClient) {
     console.warn("[verify-and-match] Phase D: no database client available");
     return alternatives;
   }
 
-  if (!product.category || product.category === "Unknown") {
-    console.warn("[verify-and-match] Phase D: product has no category");
-    return alternatives;
-  }
-
   try {
-    // Query for same-category products (excluding the scanned product)
-    const { data: rows, error } = await supabaseClient
-      .from("products")
-      .select("*")
-      .eq("category", product.category)
-      .neq("barcode", product.barcode)
-      .limit(20);
+    let rows: any[] = [];
 
-    if (error) {
-      console.warn("[verify-and-match] Phase D: query error:", error.message);
-      return alternatives;
+    // -- STRATEGY 1: Exact category match -----------------------------------
+    //    If OFF returned a category string that exactly matches a row in the
+    //    products table, use those as alternatives.
+    if (product.category && product.category !== "Unknown") {
+      const { data, error } = await supabaseClient
+        .from("products")
+        .select("*")
+        .eq("category", product.category)
+        .neq("barcode", product.barcode)
+        .limit(20);
+
+      if (!error && data && data.length > 0) {
+        rows = data;
+        console.log(
+          `[verify-and-match] Phase D: Strategy 1 (exact category) found ${rows.length} alternatives`,
+        );
+      }
     }
 
-    if (rows && rows.length > 0) {
-      rows.forEach((r: any) => alternatives.push(r));
-      console.log(
-        `[verify-and-match] Phase D: found ${alternatives.length} alternatives in category "${product.category}"`,
-      );
+    // -- STRATEGY 2: Fuzzy category match via ILike --------------------------
+    //    OFF often returns taxonomy strings like "Biscuits, Chocolate biscuits"
+    //    that won't match our seed data's exact category. Split on commas and
+    //    search for any keyword match.
+    if (
+      rows.length === 0 &&
+      product.category &&
+      product.category !== "Unknown"
+    ) {
+      // Split the category string into individual keywords
+      const categoryWords = product.category
+        .split(/[,;]/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 3)
+        .map((s) => `%${s}%`);
+
+      for (const word of categoryWords) {
+        const { data, error } = await supabaseClient
+          .from("products")
+          .select("*")
+          .ilike("category", word)
+          .neq("barcode", product.barcode)
+          .limit(20);
+
+        if (!error && data && data.length > 0) {
+          rows = data;
+          console.log(
+            `[verify-and-match] Phase D: Strategy 2 (ILike "${word}") found ${rows.length} alternatives`,
+          );
+          break;
+        }
+      }
+    }
+
+    // -- STRATEGY 3: Ingredient-only scoring (no category match) -------------
+    //    If no category match exists at all, return ALL products in the database
+    //    scored purely by ingredient similarity. This ensures every scan returns
+    //    SOMETHING as long as there are products with overlapping ingredients.
+    if (rows.length === 0) {
+      const { data, error } = await supabaseClient
+        .from("products")
+        .select("*")
+        .neq("barcode", product.barcode)
+        .limit(30);
+
+      if (!error && data && data.length > 0) {
+        rows = data;
+        console.log(
+          `[verify-and-match] Phase D: Strategy 3 (ingredient-only scoring) found ${rows.length} candidates`,
+        );
+      }
+    }
+
+    if (rows.length > 0) {
+      alternatives.push(...rows);
     } else {
       console.log(
-        `[verify-and-match] Phase D: no alternatives found in category "${product.category}"`,
+        "[verify-and-match] Phase D: no alternatives found in any strategy",
       );
     }
   } catch (err) {
@@ -982,6 +1475,9 @@ async function saveProductToCache(
       brand: product.brand || null,
       supermarket: product.supermarket || "unknown",
       category: product.category || null,
+      categories_tags: product.categoriesTags
+        ? JSON.stringify(product.categoriesTags)
+        : null,
       ingredients: product.ingredients || null,
       price: product.price != null ? product.price : null,
       image_url: product.image_url || null,
@@ -1113,6 +1609,23 @@ Deno.serve(async (req: Request): Promise<Response> => {
       if (!error && rows && rows.length > 0) {
         product = rows[0] as ProductData;
         cacheHit = true;
+
+        // Parse the categories_tags JSON string back into an array
+        if (
+          product.categoriesTags === undefined &&
+          (rows[0] as any).categories_tags &&
+          typeof (rows[0] as any).categories_tags === "string"
+        ) {
+          try {
+            const parsed = JSON.parse((rows[0] as any).categories_tags);
+            if (Array.isArray(parsed)) {
+              product.categoriesTags = parsed;
+            }
+          } catch {
+            // Ignore parse errors; tags are optional
+          }
+        }
+
         console.log(
           `[verify-and-match] ${requestId} Phase A: cache HIT -> ${product.name}`,
         );
@@ -1157,8 +1670,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   // ============================================================================
-  //  PHASE C -- Live Apify Supermarket Scraper
+  //  PHASE C -- Live Apify Supermarket Scraper with Tiered Fallback
   // ============================================================================
+  //
+  //  Two distinct paths:
+  //
+  //  PATH 1 (OFF succeeded):
+  //    We have product name + brand + categories from Open Food Facts.
+  //    Run the Multi-Tier Search Fallback:
+  //      Tier 1: Search supermarket with cleaned brand name (e.g. "Oreo Double Cream")
+  //      Tier 2: If no own-brand match found, use OFF category tags to generate
+  //              broader keywords (e.g. "Chocolate Sandwich Biscuits") and re-search.
+  //    Merge the scraped result (price, supermarket, image) with OFF data (ingredients).
+  //
+  //  PATH 2 (OFF failed):
+  //    No product data available. Search supermarkets directly using the barcode
+  //    via the generic web scraper fallback.
   //
   //  TOKEN ENCAPSULATION:
   //    The APIFY_TOKEN is read from Deno.env.get("APIFY_TOKEN") at line 42.
@@ -1166,28 +1693,59 @@ Deno.serve(async (req: Request): Promise<Response> => {
   //    is NEVER included in the response body, headers, or any data returned
   //    to the client. Even in error messages, the token is omitted.
 
-  if (!product) {
-    console.log(
-      `[verify-and-match] ${requestId} Phase C: scraping ${supermarket} for barcode...`,
-    );
-
-    // First try the supermarket-specific actor
-    product = await scrapeSupermarketProduct(barcode, supermarket, barcode, "");
-
-    // If that fails, try the generic fallback that searches all supermarkets
-    if (!product) {
+  if (!cacheHit) {
+    if (product && product.source === "openfoodfacts") {
+      // PATH 1: OFF found the product. Now find it (or its generic twin) on
+      // the selected supermarket's website using tiered fallback.
       console.log(
-        `[verify-and-match] ${requestId} Phase C: supermarket actor failed, trying generic fallback...`,
+        `[verify-and-match] ${requestId} Phase C: running tiered fallback on ${supermarket}...`,
       );
+
+      const scrapedProduct = await searchWithTieredFallback(
+        barcode,
+        supermarket,
+        product.name,
+        product.brand,
+        product.categoriesTags,
+        product.category,
+      );
+
+      if (scrapedProduct) {
+        console.log(
+          `[verify-and-match] ${requestId} Phase C: scraped -> "${scrapedProduct.name}" at ${supermarket} for GBP ${scrapedProduct.price}`,
+        );
+
+        // Merge scraped data with OFF data:
+        //   - Keep OFF data: name, brand, category, ingredients (more reliable)
+        //   - Use scraped: price, supermarket, image_url (supermarket-specific)
+        product.price = scrapedProduct.price || product.price;
+        product.supermarket = scrapedProduct.supermarket || supermarket;
+        product.image_url = scrapedProduct.image_url || product.image_url;
+      } else {
+        console.log(
+          `[verify-and-match] ${requestId} Phase C: no results on ${supermarket} for this product.`,
+        );
+      }
+    } else if (!product) {
+      // PATH 2: No OFF data. Search supermarkets using the barcode directly
+      // via the generic web scraper fallback.
+      console.log(
+        `[verify-and-match] ${requestId} Phase C: scraping ${supermarket} for barcode...`,
+      );
+
+      // Try the generic fallback that searches all supermarkets
       product = await scrapeAllSupermarketsFallback(barcode);
-    }
 
-    if (product) {
-      console.log(
-        `[verify-and-match] ${requestId} Phase C: found -> "${product.name}" at ${product.supermarket}`,
-      );
+      if (product) {
+        console.log(
+          `[verify-and-match] ${requestId} Phase C: found -> "${product.name}" at ${product.supermarket}`,
+        );
+      }
     }
   }
+
+  // Note: if cacheHit is true, Phase C is skipped entirely because we already
+  // have all the data from a previous scan.
 
   // ============================================================================
   //  HANDLE: No data found from any source

@@ -3,3 +3,6 @@ node_modules/
 
 # Supabase CLI temporary files
 supabase/.temp/
+
+# Local environment variables (secrets)
+.env
